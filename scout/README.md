@@ -30,9 +30,14 @@ hit about a quarter of the time, while the house bot in the kit's own recording 
 | probe-late | v4a plus a self-check for late answers | 3.83 |
 | v5a | v4a plus run for a laser first | 3.90 |
 | v4a | take every duel, hold 60 m | 3.94 |
+| v9d | v9b holding 100 m instead of 60 m | 3.98 |
+| v9a | v5a plus walk to crates, drones and loose cubes | 4.25 |
+| v9c | v9b plus strafe and close in as soon as we open fire | 4.27 |
+| v9b | v9a plus go looking for crates and drones when idle | 4.54 |
 
 Each score is the mean of 48 matches; the same code re-run moves by a few tenths.
-The self-check build proves the bot never answers late and never crashes in scored matches.
+The self-check build shows no late answers and no crashes in the first 30 s of scored matches.
+Pattern so far: the more the bot fights and farms, the higher it scores; hiding, running and rooftops all scored lower.
 
 ## What the recordings say
 
