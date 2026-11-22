@@ -64,6 +64,9 @@ fn main() {
     let mut last = (String::from("[0,0]"), String::from("[0,0]"));
     let mut panics = 0u32;
     let mut eof = false;
+    // diagnostic counters: decisions we skipped or answered slowly early in the match
+    let mut last_tick = -1.0f64;
+    let mut late = 0u32;
     let send = |s: &str| -> bool {
         let mut out = stdout.lock();
         out.write_all(s.as_bytes()).is_ok() && out.write_all(b"\n").is_ok() && out.flush().is_ok()
@@ -114,6 +117,17 @@ fn main() {
         }
         if let Some(o) = newest {
             let tick = o.get("tick").f();
+            let t_obs = o.get("t").f();
+            if last_tick >= 0.0 && tick - last_tick > 2.5 && t_obs < 30.0 {
+                late += 1;
+            }
+            last_tick = tick;
+            let t_dec = std::time::Instant::now();
+            if let Some(b) = brain.as_mut() {
+                if b.prm.probe_late > 0.5 && (late >= 2 || panics >= 1) {
+                    b.force_idle = true;
+                }
+            }
             let line = match brain.as_mut() {
                 Some(b) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| b.decide(&o))) {
                     Ok(a) => {
@@ -132,6 +146,9 @@ fn main() {
             };
             if !send(&line) {
                 return;
+            }
+            if t_dec.elapsed().as_millis() >= 35 && t_obs < 30.0 {
+                late += 1;
             }
         }
         if ended {
