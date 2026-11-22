@@ -228,6 +228,45 @@ fn main() {
             }
         }
         "patch" => dump_patch(args[2].parse().unwrap(), args[3].parse().unwrap()),
+        "replay" => {
+            // feed a recorded stream of real observations to the brain and print what it decides
+            let text = std::fs::read_to_string(&args[2]).unwrap();
+            let map = Arc::new(Map::load("arena"));
+            let mut prm = Params::default();
+            prm.apply(&args.get(3).cloned().unwrap_or_default().replace(';', "\n"));
+            prm.debug = 1.0;
+            let mut brain: Option<Brain> = None;
+            for line in text.lines() {
+                let m = match json::parse(line) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                match m.get("type").s() {
+                    "hello" => brain = Some(Brain::new(&m, map.clone(), prm.clone())),
+                    "obs" => {
+                        if let Some(b) = brain.as_mut() {
+                            let a = b.decide(&m);
+                            let me = m.get("self");
+                            println!(
+                                "t={:5.1} hp={:6.0} mv=({:5.2},{:5.2}) boost={} jump={} aim=({:5.2},{:5.2}) fire={:?} rl={} | {}",
+                                m.get("t").f(),
+                                me.get("hp").f(),
+                                a.mv[0],
+                                a.mv[1],
+                                a.boost as u8,
+                                a.jump as u8,
+                                a.aim[0],
+                                a.aim[1],
+                                a.fire,
+                                a.reload as u8,
+                                a.label
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         "match" => {
             let map = Arc::new(Map::load("arena"));
             let seed: u64 = args[2].parse().unwrap();
