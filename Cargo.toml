@@ -1,0 +1,23 @@
+[package]
+name = "mechbot"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mechbot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mechbot"
+path = "src/main.rs"
+
+[[bin]]
+name = "sim"
+path = "src/bin/sim.rs"
+
+[profile.release]
+opt-level = 3
+debug = false
+panic = "unwind"
+lto = true
+codegen-units = 1
