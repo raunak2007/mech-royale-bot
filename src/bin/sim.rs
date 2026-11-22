@@ -29,6 +29,62 @@ fn parse_spec(s: &str) -> Vec<Spec> {
     out
 }
 
+/// Practice-style opposition: 15 house bots as one squad (4 easy, 4 medium, 4 hard, 3 expert by slot),
+/// sharing what they see of the subject (mech 0), never targeting each other, hunting it weakest first.
+#[derive(Clone)]
+struct SquadCfg {
+    /// one more hunter for every `k` house bots dead
+    k: f64,
+    /// from this time on every house bot hunts
+    late: f64,
+    skill: [f64; 4],
+    dodge: [f64; 4],
+    push: [f64; 4],
+    gate: [f64; 4],
+    retreat: [f64; 4],
+    laser: [f64; 4],
+    grudge: f64,
+    h0: f64,
+}
+fn squad_cfg() -> Option<SquadCfg> {
+    let v = std::env::var("SIM_SQUAD").ok()?;
+    let mut c = SquadCfg { k: 4.0, late: 240.0, skill: [0.06, 0.03, 0.015, 0.006], dodge: [0.0, 0.0, 1.0, 1.0], push: [50.0; 4], gate: [1.0; 4], retreat: [0.0, 0.0, 0.4, 0.4], laser: [0.0, 0.0, 0.0, 0.0], grudge: 6.0, h0: 1.0 };
+    for kv in v.split(';') {
+        if let Some((k, x)) = kv.split_once('=') {
+            let xs: Vec<f64> = x.split('/').filter_map(|y| y.trim().parse().ok()).collect();
+            let four = |dst: &mut [f64; 4]| {
+                for i in 0..4 {
+                    if let Some(y) = xs.get(i.min(xs.len().saturating_sub(1))) {
+                        dst[i] = *y;
+                    }
+                }
+            };
+            match k.trim() {
+                "k" => c.k = xs.first().copied().unwrap_or(c.k),
+                "late" => c.late = xs.first().copied().unwrap_or(c.late),
+                "grudge" => c.grudge = xs.first().copied().unwrap_or(c.grudge),
+                "h0" => c.h0 = xs.first().copied().unwrap_or(c.h0),
+                "skill" => four(&mut c.skill),
+                "dodge" => four(&mut c.dodge),
+                "push" => four(&mut c.push),
+                "gate" => four(&mut c.gate),
+                "retreat" => four(&mut c.retreat),
+                "laser" => four(&mut c.laser),
+                _ => {}
+            }
+        }
+    }
+    Some(c)
+}
+fn tier_of(id: usize) -> usize {
+    match id {
+        0..=4 => 0,
+        5..=8 => 1,
+        9..=12 => 2,
+        _ => 3,
+    }
+}
+
 fn make(spec: &Spec, map: &Arc<Map>, id: usize, seed: u64) -> Box<dyn Ctl> {
     let mut hello = json::parse(HELLO).unwrap();
     if let json::J::Obj(v) = &mut hello {
@@ -49,7 +105,7 @@ fn make(spec: &Spec, map: &Arc<Map>, id: usize, seed: u64) -> Box<dyn Ctl> {
         }
         "example" => Box::new(Example::new()),
         _ => {
-            let mut skill = 0.02;
+            let mut skill = 0.008;
             let mut aggro = 200.0;
             for line in spec.params.lines() {
                 if let Some((k, v)) = line.split_once('=') {
@@ -72,14 +128,62 @@ fn make(spec: &Spec, map: &Arc<Map>, id: usize, seed: u64) -> Box<dyn Ctl> {
                     if k.trim() == "hunt" {
                         h.hunt = v.trim() != "0";
                     }
+                    if k.trim() == "look" {
+                        h.look = v.trim().parse().unwrap_or(h.look);
+                    }
+                    if k.trim() == "roam" {
+                        h.roam = v.trim().parse().unwrap_or(h.roam);
+                    }
+                    if k.trim() == "push" {
+                        h.push = v.trim().parse().unwrap_or(h.push);
+                    }
                     if k.trim() == "focus" {
                         h.focus = v.trim().parse().unwrap_or(-1);
                     }
+                    if k.trim() == "gate" {
+                        h.gate = v.trim().parse().unwrap_or(h.gate);
+                    }
+                    if k.trim() == "retreat" {
+                        h.retreat = v.trim().parse().unwrap_or(h.retreat);
+                    }
                 }
+            }
+            if let Some(c) = squad_cfg() {
+                let tr = tier_of(id);
+                h.skill = c.skill[tr];
+                h.dodge = c.dodge[tr] > 0.5;
+                h.push = c.push[tr];
+                h.gate = c.gate[tr];
+                h.retreat = c.retreat[tr];
+                h.focus = 0;
+                h.hunt = false;
+                h.aggro = 400.0;
+                h.sq_on = true;
+                h.sq_grudge = c.grudge;
             }
             Box::new(h)
         }
     }
+}
+
+/// Engagement profile of one kind of bot, by range bucket (<40, <80, <120, <200 m):
+/// frames, closing speed, lateral speed, speed, boosting, airborne, shots, hits.
+static PROF: std::sync::Mutex<[[f64; 8]; 4]> = std::sync::Mutex::new([[0.0; 8]; 4]);
+static AIMD: std::sync::Mutex<[[f64; 7]; 5]> = std::sync::Mutex::new([[0.0; 7]; 5]);
+/// How predictable each kind of bot is under fire: for flight times 0.2/0.4/0.6 s, (frames, sum of the
+/// chance that a perfectly timed straight-line lead shot hits), first for house bots, then for brains.
+static PRED: std::sync::Mutex<[[[f64; 2]; 3]; 2]> = std::sync::Mutex::new([[[0.0; 2]; 3]; 2]);
+
+fn phi(x: f64) -> f64 {
+    // normal cdf (Abramowitz-Stegun erf)
+    let z = x / std::f64::consts::SQRT_2;
+    let t = 1.0 / (1.0 + 0.3275911 * z.abs());
+    let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * (-z * z).exp();
+    0.5 * (1.0 + if z >= 0.0 { y } else { -y })
+}
+
+fn prof_bucket(d: f64) -> Option<usize> {
+    [40.0, 80.0, 120.0, 200.0].iter().position(|&b| d < b)
 }
 
 struct Out {
@@ -95,6 +199,13 @@ struct Out {
     cubes: f64,
     kills: u32,
     dmg: f64,
+    all_places: Vec<usize>,
+    weapon_t: f64,
+    first_dmg_t: f64,
+    cubes_at: [f64; 3],
+    laser_t: f64,
+    /// first 60 s: decisions alive, decisions with some mech within 200 m holding a line on us, sum of nearest-mech distance
+    seen: [f64; 3],
 }
 
 fn run(map: &Arc<Map>, seed: u64, specs: &[Spec], trace: Option<&str>, verbose: bool) -> Out {
@@ -106,11 +217,204 @@ fn run(map: &Arc<Map>, seed: u64, specs: &[Spec], trace: Option<&str>, verbose: 
             sim.mechs[0].pos = [v[0], v[1], map.ground(v[0], v[1])];
         }
     }
+    if let Ok(v) = std::env::var("SIM_HOUSE_LASER") {
+        // share of house bots that start with a laser already in hand
+        let share: f64 = v.parse().unwrap_or(1.0);
+        for i in 0..n {
+            if specs[i].kind == "house" && ((i * 7919 + seed as usize * 31) % 100) as f64 / 100.0 < share {
+                sim.mechs[i].w[1] = Some(mechbot::sim::Weapon { kind: 2, cooldown: 0.0, ammo: 0.0, reload: 0.0, charge: 0.0, held_full: 0.0 });
+            }
+        }
+    }
+    let squad = squad_cfg();
+    if let Some(c) = &squad {
+        for i in 1..n {
+            if ((i * 7919 + seed as usize * 31) % 100) as f64 / 100.0 < c.laser[tier_of(i)] {
+                sim.mechs[i].w[1] = Some(mechbot::sim::Weapon { kind: 2, cooldown: 0.0, ammo: 0.0, reload: 0.0, charge: 0.0, held_full: 0.0 });
+            }
+        }
+    }
+    let mut hunters: Vec<usize> = Vec::new();
+    let mut known: Option<([f64; 3], [f64; 3], f64)> = None;
     let mut ctls: Vec<Box<dyn Ctl>> = (0..n).map(|i| make(&specs[i], map, i, seed)).collect();
     let mut tr = trace.map(|p| std::fs::File::create(p).unwrap());
     let (mut max_us, mut sum_us, mut decisions) = (0u128, 0u128, 0u64);
-    while !sim.finished() {
+    let prof_kind = std::env::var("SIM_PROF").ok();
+    let mut prev: Vec<([f64; 3], u32, u32)> = sim.mechs.iter().map(|m| (m.pos, m.shots, m.hits)).collect();
+    let mut weapon_t = f64::INFINITY;
+    let mut first_dmg_t = f64::INFINITY;
+    let mut cubes_at = [-1.0f64; 3];
+    let mut laser_t = f64::INFINITY;
+    let mut seen = [0.0f64; 3];
+    let pred_on = std::env::var("SIM_PRED").is_ok();
+    // per mech: recent (pos, vel, under fire) at each decision
+    let mut hist: Vec<std::collections::VecDeque<([f64; 2], [f64; 2], bool)>> = (0..n).map(|_| Default::default()).collect();
+    while !sim.finished() && !(squad.is_some() && !sim.mechs[0].alive) {
+        if let (Some(c), true) = (&squad, sim.tick % 2 == 0) {
+            if (1..n).any(|i| sim.sees(i, 0)) {
+                known = Some((sim.mechs[0].pos, sim.mechs[0].vel, sim.t));
+            }
+            hunters.retain(|&i| sim.mechs[i].alive);
+            let alive: Vec<usize> = (1..n).filter(|&i| sim.mechs[i].alive).collect();
+            let dead = (n - 1 - alive.len()) as f64;
+            let want = if sim.t >= c.late { alive.len() } else { ((c.h0 + (dead / c.k).floor()) as usize).min(alive.len()) };
+            while hunters.len() < want {
+                // the weakest left, and among those the one nearest the subject
+                let me = sim.mechs[0].pos;
+                let pick = alive.iter().filter(|i| !hunters.contains(i)).min_by(|a, b| {
+                    let ka = (tier_of(**a), (sim.mechs[**a].pos[0] - me[0]).hypot(sim.mechs[**a].pos[1] - me[1]));
+                    let kb = (tier_of(**b), (sim.mechs[**b].pos[0] - me[0]).hypot(sim.mechs[**b].pos[1] - me[1]));
+                    ka.partial_cmp(&kb).unwrap()
+                });
+                match pick {
+                    Some(&i) => hunters.push(i),
+                    None => break,
+                }
+            }
+            for i in 1..n {
+                ctls[i].squad(hunters.contains(&i), known);
+            }
+        }
+        if pred_on && sim.tick % 2 == 0 {
+            let mut acc = PRED.lock().unwrap();
+            for i in 0..n {
+                let m = &sim.mechs[i];
+                if !m.alive {
+                    hist[i].clear();
+                    continue;
+                }
+                let hot = sim.t - m.last_combat < 2.5;
+                hist[i].push_back(([m.pos[0], m.pos[1]], [m.vel[0], m.vel[1]], hot));
+                if hist[i].len() > 7 {
+                    hist[i].pop_front();
+                }
+                let len = hist[i].len();
+                let kind = if specs[i].kind == "brain" { 1 } else { 0 };
+                for (ti, k) in [2usize, 4, 6].iter().enumerate() {
+                    if len <= *k {
+                        continue;
+                    }
+                    let (p0, v0, hot0) = hist[i][len - 1 - k];
+                    if !hot0 {
+                        continue;
+                    }
+                    let tau = *k as f64 * 0.1;
+                    let (ex, ey) = (p0[0] + v0[0] * tau - m.pos[0], p0[1] + v0[1] * tau - m.pos[1]);
+                    let sig = 0.0105 * 252.0 * tau;
+                    let mut p = 0.0;
+                    for a in 0..8 {
+                        let th = std::f64::consts::PI * (a as f64 + 0.5) / 8.0;
+                        let e = (ex * th.sin() - ey * th.cos()).abs();
+                        p += phi((2.5 - e) / sig) - phi((-2.5 - e) / sig);
+                    }
+                    acc[kind][ti][0] += 1.0;
+                    acc[kind][ti][1] += p / 8.0;
+                }
+            }
+        }
+        if std::env::var("SIM_LOOT").is_ok() && sim.tick == 44 {
+            // where the loot really is, 2.2 s in: nearest ground weapon and nearest laser to the subject
+            let m = &sim.mechs[0];
+            let mut dn = f64::INFINITY;
+            let mut dl = f64::INFINITY;
+            let mut n150 = 0;
+            for pk in &sim.pickups {
+                let gz = map.walk_z(pk.pos[0], pk.pos[1]) as f64;
+                if (pk.pos[2] - gz).abs() > 3.0 {
+                    continue;
+                }
+                let d = (pk.pos[0] - m.pos[0]).hypot(pk.pos[1] - m.pos[1]);
+                dn = dn.min(d);
+                if d < 150.0 {
+                    n150 += 1;
+                }
+                if pk.kind == 2 {
+                    dl = dl.min(d);
+                }
+            }
+            println!("LOOT seed {} nearest {:.0} laser {:.0} within150 {} total {}", seed, dn, dl, n150, sim.pickups.len());
+        }
+        if weapon_t.is_infinite() && sim.mechs[0].alive && sim.mechs[0].w[1].is_some() {
+            weapon_t = sim.t;
+        }
+        if first_dmg_t.is_infinite() && sim.mechs[0].dmg_taken > 0.0 {
+            first_dmg_t = sim.t;
+        }
+        if sim.tick % 2 == 0 && sim.t < 60.0 && sim.mechs[0].alive {
+            let me = &sim.mechs[0];
+            let c = [me.pos[0], me.pos[1], me.pos[2] + 4.5];
+            let mut near = 400.0f64;
+            let mut vis = false;
+            for o in sim.mechs.iter().skip(1) {
+                if !o.alive {
+                    continue;
+                }
+                let d = (o.pos[0] - me.pos[0]).hypot(o.pos[1] - me.pos[1]);
+                near = near.min(d);
+                if d < 200.0 && map.los([o.pos[0], o.pos[1], o.pos[2] + 8.0], c) {
+                    vis = true;
+                }
+            }
+            seen[0] += 1.0;
+            seen[1] += if vis { 1.0 } else { 0.0 };
+            seen[2] += near;
+        }
+        if laser_t.is_infinite() && sim.mechs[0].alive && sim.mechs[0].w.iter().flatten().any(|w| w.kind == 2) {
+            laser_t = sim.t;
+        }
+        for (k, tt) in [30.0, 60.0, 90.0].iter().enumerate() {
+            if cubes_at[k] < 0.0 && sim.t >= *tt && sim.mechs[0].alive {
+                cubes_at[k] = sim.mechs[0].cubes;
+            }
+        }
         if sim.tick % 2 == 0 {
+            if let Some(kind) = prof_kind.as_deref() {
+                let mut acc = PROF.lock().unwrap();
+                for i in 0..n {
+                    let m = &sim.mechs[i];
+                    if !m.alive || specs[i].kind != kind {
+                        continue;
+                    }
+                    let eye = [m.pos[0], m.pos[1], m.pos[2] + 8.0];
+                    let mut tg: Option<(f64, usize, f64)> = None;
+                    for j in 0..n {
+                        let o = &sim.mechs[j];
+                        if j == i || !o.alive {
+                            continue;
+                        }
+                        let d = (o.pos[0] - m.pos[0]).hypot(o.pos[1] - m.pos[1]);
+                        if d > 200.0 {
+                            continue;
+                        }
+                        let aa = mechbot::brain::wrap(m.aim[0] - (o.pos[1] - m.pos[1]).atan2(o.pos[0] - m.pos[0])).abs();
+                        if aa < 0.08 && tg.map_or(true, |t| aa < t.0) && map.los(eye, [o.pos[0], o.pos[1], o.pos[2] + 4.5]) {
+                            tg = Some((aa, j, d));
+                        }
+                    }
+                    if let Some((_, j, d)) = tg {
+                        if let Some(b) = prof_bucket(d) {
+                            let o = &sim.mechs[j];
+                            let (pa, pb) = (prev[i].0, prev[j].0);
+                            let d0 = (pb[0] - pa[0]).hypot(pb[1] - pa[1]);
+                            let (vx, vy) = ((m.pos[0] - pa[0]) / 0.1, (m.pos[1] - pa[1]) / 0.1);
+                            let (ux, uy) = ((o.pos[0] - m.pos[0]) / d.max(0.1), (o.pos[1] - m.pos[1]) / d.max(0.1));
+                            let a = &mut acc[b];
+                            a[0] += 1.0;
+                            a[1] += (d0 - d) / 0.1;
+                            a[2] += (-vx * uy + vy * ux).abs();
+                            a[3] += vx.hypot(vy);
+                            a[4] += if m.act.boost { 1.0 } else { 0.0 };
+                            a[5] += if m.grounded { 0.0 } else { 1.0 };
+                            a[6] += (m.shots - prev[i].1) as f64;
+                            a[7] += (m.hits - prev[i].2) as f64;
+                        }
+                    }
+                }
+                for i in 0..n {
+                    let m = &sim.mechs[i];
+                    prev[i] = (m.pos, m.shots, m.hits);
+                }
+            }
             for i in 0..n {
                 if !sim.mechs[i].alive {
                     continue;
@@ -157,13 +461,22 @@ fn run(map: &Arc<Map>, seed: u64, specs: &[Spec], trace: Option<&str>, verbose: 
             );
         }
     }
+    if sim.aim_diag {
+        let mut tot = AIMD.lock().unwrap();
+        for b in 0..5 {
+            for k in 0..7 {
+                tot[b][k] += sim.aim_acc[b][k];
+            }
+        }
+    }
     if verbose {
         println!("  gun fired by range bucket {:?} hit {:?} | laser fired {} hit {}", sim.gun_fired, sim.gun_hit, sim.laser_fired, sim.laser_hit);
     }
     let m = &sim.mechs[0];
     let mut deaths: Vec<f64> = sim.death_log.iter().map(|d| d.0).collect();
     deaths.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    Out { place: m.place, death_t: m.death_t, death_by: m.death_by.clone(), deaths, max_us, sum_us, decisions, zone_dmg: m.zone_dmg, stuck: m.stuck_ticks, cubes: m.cubes, kills: m.kills, dmg: m.dmg_dealt }
+    let all_places: Vec<usize> = sim.mechs.iter().map(|x| x.place).collect();
+    Out { place: m.place, death_t: m.death_t, death_by: m.death_by.clone(), deaths, max_us, sum_us, decisions, zone_dmg: m.zone_dmg, stuck: m.stuck_ticks, cubes: m.cubes, kills: m.kills, dmg: m.dmg_dealt, all_places, weapon_t, first_dmg_t, cubes_at, laser_t, seen }
 }
 
 fn main() {
@@ -227,13 +540,159 @@ fn main() {
                 println!("  comp {} size {} e.g. at {:?}", k, n, nav.pos_of(c as u32));
             }
         }
+        "visat" => {
+            // share of ground 50..195 m away that can see a mech standing at each given point
+            let m = Map::load("arena");
+            let mut buf: Vec<u16> = Vec::new();
+            let mut k = 2;
+            while k + 1 < args.len() {
+                let (x, y): (f64, f64) = (args[k].parse().unwrap(), args[k + 1].parse().unwrap());
+                k += 2;
+                let z = m.walk_z(x, y) as f64;
+                let (mid, top) = ([x, y, z + 4.5], [x, y, z + 8.9]);
+                let mut res = Vec::new();
+                for &cm in &[3.0f64, 4.0, 5.0, 1e9] {
+                    let (mut seen, mut n, mut seen_cyl) = (0, 0, 0);
+                    for &r in &[50.0f64, 70.0, 95.0, 125.0, 160.0, 195.0] {
+                        for j in 0..32 {
+                            let a = j as f64 * std::f64::consts::PI / 16.0 + r * 0.01;
+                            let (vx, vy) = (x + a.cos() * r, y + a.sin() * r);
+                            if vx < m.bx0 + 1.0 || vx > m.bx1 - 1.0 || vy < m.by0 + 1.0 || vy > m.by1 - 1.0 || m.wall_dist(vx, vy) < 1.0 {
+                                continue;
+                            }
+                            let eye = [vx, vy, m.walk_z(vx, vy) as f64 + 8.0];
+                            n += 1;
+                            if (m.canopy_len(eye, mid, cm, &mut buf) < cm && m.los(eye, mid)) || (m.canopy_len(eye, top, cm, &mut buf) < cm && m.los(eye, top)) {
+                                seen += 1;
+                            }
+                            if m.los_vis_m(eye, mid, cm) || m.los_vis_m(eye, top, cm) {
+                                seen_cyl += 1;
+                            }
+                        }
+                    }
+                    res.push(format!("{}m: ell {:.2} cyl {:.2}", if cm > 1e8 { "none".to_string() } else { format!("{cm}") }, seen as f64 / n.max(1) as f64, seen_cyl as f64 / n.max(1) as f64));
+                }
+                println!("({x:.0},{y:.0}) wall {:.0} m | {}", m.wall_dist(x, y), res.join(" | "));
+            }
+        }
+        "hides" => {
+            let t0 = std::time::Instant::now();
+            let m = Map::load("arena");
+            let nav = mechbot::nav::Nav::new(&m);
+            let t1 = std::time::Instant::now();
+            let cm: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4.6);
+            let h = mechbot::brain::find_hides(&m, &nav, cm);
+            println!("trees {} | hide spots {} (perfect {}) | map+nav {:?}, hides {:?}", m.trees.len(), h.len(), h.iter().filter(|x| x.vis == 0.0).count(), t1 - t0, t1.elapsed());
+            let near = |x: f64, y: f64| h.iter().filter(|s| (s.x - x).hypot(s.y - y) < 40.0).map(|s| format!("({:.0},{:.0}) vis {:.2}", s.x, s.y, s.vis)).collect::<Vec<_>>();
+            println!("near (235,-240): {:?}", near(235.0, -240.0));
+            // how far is the nearest hide spot from random walkable points
+            let mut ds: Vec<f64> = Vec::new();
+            let mut k = 0u64;
+            while ds.len() < 400 {
+                k += 1;
+                let x = -400.0 + ((k * 7919) % 880) as f64;
+                let y = -300.0 + ((k * 104729) % 660) as f64;
+                if m.wall_dist(x, y) < 3.5 {
+                    continue;
+                }
+                ds.push(h.iter().map(|s| (s.x - x).hypot(s.y - y)).fold(1e9, f64::min));
+            }
+            ds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!("distance to nearest hide spot: median {:.0} m, p90 {:.0} m, max {:.0} m", ds[200], ds[360], ds[399]);
+        }
+        "roofs" => {
+            let t0 = std::time::Instant::now();
+            let m = Map::load("arena");
+            println!("map load incl. roofs: {:?}; regions {}", t0.elapsed(), m.roofs.len());
+            let mut good: Vec<&mechbot::geom::Roof> = m.roofs.iter().filter(|r| r.depth >= 7.0 && r.rise >= 9.0 && !r.access.is_empty()).collect();
+            good.sort_by(|a, b| b.depth.partial_cmp(&a.depth).unwrap());
+            println!("usable (depth>=7, rise>=9, has access): {}", good.len());
+            let climbable = good.iter().filter(|r| r.rise <= 48.0).count();
+            println!("  of which rise<=48 m: {}", climbable);
+            for r in good.iter().take(14) {
+                println!("  roof {} top {:.1} rise {:.1} depth {:.1} area {:.0} best ({:.0},{:.0}) access {}", r.id, r.top, r.rise, r.depth, r.area, r.best.0, r.best.1, r.access.len());
+            }
+            let hist = |lo: f32, hi: f32| good.iter().filter(|r| r.rise >= lo && r.rise < hi).count();
+            println!("rise histogram: 9-15: {}, 15-25: {}, 25-35: {}, 35-48: {}, 48+: {}", hist(9.0, 15.0), hist(15.0, 25.0), hist(25.0, 35.0), hist(35.0, 48.0), hist(48.0, 999.0));
+        }
         "patch" => dump_patch(args[2].parse().unwrap(), args[3].parse().unwrap()),
+        "replay" => {
+            // feed a recorded stream of real observations to the brain and print what it decides
+            let text = std::fs::read_to_string(&args[2]).unwrap();
+            let map = Arc::new(Map::load("arena"));
+            let mut prm = Params::default();
+            prm.apply(&args.get(3).cloned().unwrap_or_default().replace(';', "\n"));
+            prm.debug = 1.0;
+            let mut brain: Option<Brain> = None;
+            for line in text.lines() {
+                let m = match json::parse(line) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                match m.get("type").s() {
+                    "hello" => brain = Some(Brain::new(&m, map.clone(), prm.clone())),
+                    "obs" => {
+                        if let Some(b) = brain.as_mut() {
+                            let a = b.decide(&m);
+                            let me = m.get("self");
+                            println!(
+                                "t={:5.1} hp={:6.0} mv=({:5.2},{:5.2}) boost={} jump={} aim=({:5.2},{:5.2}) fire={:?} rl={} | {}",
+                                m.get("t").f(),
+                                me.get("hp").f(),
+                                a.mv[0],
+                                a.mv[1],
+                                a.boost as u8,
+                                a.jump as u8,
+                                a.aim[0],
+                                a.aim[1],
+                                a.fire,
+                                a.reload as u8,
+                                a.label
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         "match" => {
             let map = Arc::new(Map::load("arena"));
             let seed: u64 = args[2].parse().unwrap();
             let specs = parse_spec(&args[3]);
             let o = run(&map, seed, &specs, args.get(4).map(|s| s.as_str()), true);
             println!("subject place {} t {:.1} by {} | decide mean {} us max {} us | deaths at {:?}", o.place, o.death_t, o.death_by, o.sum_us / o.decisions.max(1) as u128, o.max_us, o.deaths.iter().map(|d| d.round() as i64).collect::<Vec<_>>());
+        }
+        "groups" => {
+            // self-play: mean points of every distinct kind+settings group in the spec
+            let map = Arc::new(Map::load("arena"));
+            let n: u64 = args[2].parse().unwrap();
+            let seed0: u64 = args[3].parse().unwrap();
+            let specs = parse_spec(&args[4]);
+            let mut agg: std::collections::BTreeMap<String, (f64, u32, u32)> = Default::default();
+            for k in 0..n {
+                // rotate who sits in which slot so no group keeps the same spawn order
+                let rot = (k as usize) % specs.len();
+                let mut sp: Vec<Spec> = Vec::new();
+                for i in 0..specs.len() {
+                    let s = &specs[(i + rot) % specs.len()];
+                    sp.push(Spec { kind: s.kind.clone(), params: s.params.clone() });
+                }
+                let o = run(&map, seed0 + k, &sp, None, false);
+                for (i, pl) in o.all_places.iter().enumerate() {
+                    let key = format!("{}[{}]", sp[i].kind, sp[i].params);
+                    let e = agg.entry(key).or_insert((0.0, 0, 0));
+                    e.0 += (sp.len() - pl) as f64;
+                    e.1 += 1;
+                    if *pl == 1 {
+                        e.2 += 1;
+                    }
+                }
+            }
+            for (k, v) in &agg {
+                let flat = k.replace('\n', ";");
+                let short: String = flat.chars().rev().take(60).collect::<String>().chars().rev().collect();
+                println!("{:6.2} pts  wins {:3}  n {:4}  ..{}", v.0 / v.1 as f64, v.2, v.1, short);
+            }
         }
         "batch" => {
             let map = Arc::new(Map::load("arena"));
@@ -247,10 +706,36 @@ fn main() {
             let mut death_sum = 0.0;
             let mut nth = vec![0.0f64; specs.len()];
             let (mut zone, mut stuck, mut cubes, mut kills, mut dmg) = (0.0, 0u64, 0.0, 0u32, 0.0);
+            let mut wts: Vec<f64> = Vec::new();
+            let mut fdt: Vec<f64> = Vec::new();
+            let mut lts: Vec<f64> = Vec::new();
+            let mut seen = [0.0f64; 3];
+            let mut cub = [(0.0f64, 0u32); 3];
+            let mut kby = [0.0f64; 5];
+            let mut alive_at = [0.0f64; 5];
             for k in 0..n {
                 let o = run(&map, seed0 + k, &specs, None, false);
+                for (ti, tt) in [45.0f64, 105.0, 150.0, 200.0, 250.0].iter().enumerate() {
+                    let lim = tt.min(o.death_t);
+                    kby[ti] += o.deaths.iter().filter(|d| **d < lim - 1e-6).count() as f64;
+                    if o.death_t > *tt {
+                        alive_at[ti] += 1.0;
+                    }
+                }
+                wts.push(o.weapon_t);
+                fdt.push(o.first_dmg_t);
+                lts.push(o.laser_t);
+                for k in 0..3 {
+                    seen[k] += o.seen[k];
+                }
+                for k in 0..3 {
+                    if o.cubes_at[k] >= 0.0 {
+                        cub[k].0 += o.cubes_at[k];
+                        cub[k].1 += 1;
+                    }
+                }
                 if std::env::var("SIM_VERBOSE").is_ok() {
-                    println!("seed {} place {} t {:.0} by {} kills {} dmg {:.0} zone {:.0}", seed0 + k, o.place, o.death_t, o.death_by, o.kills, o.dmg, o.zone_dmg);
+                    println!("seed {} place {} t {:.0} by {} kills {} dmg {:.0} zone {:.0} weapon_t {:.0} first_dmg {:.0}", seed0 + k, o.place, o.death_t, o.death_by, o.kills, o.dmg, o.zone_dmg, o.weapon_t, o.first_dmg_t);
                 }
                 pts += (specs.len() - o.place) as f64;
                 places[o.place] += 1;
@@ -274,9 +759,35 @@ fn main() {
             let nf = n as f64;
             println!("{} x{}: mean points {:.2} | mean death t {:.0}s | places {:?}", specs[0].kind, n, pts / nf, death_sum / nf, &places[1..]);
             println!("  causes {:?} | zone dmg {:.0} | stuck ticks {:.0} | cubes {:.1} | kills {:.2} | dmg dealt {:.0}", by, zone / nf, stuck as f64 / nf, cubes / nf, kills as f64 / nf, dmg / nf);
+            println!("  others dead before min(T, our death) for T=45/105/150/200/250: {:.2}/{:.2}/{:.2}/{:.2}/{:.2} | we are alive at those times: {:.2}/{:.2}/{:.2}/{:.2}/{:.2}", kby[0] / nf, kby[1] / nf, kby[2] / nf, kby[3] / nf, kby[4] / nf, alive_at[0] / nf, alive_at[1] / nf, alive_at[2] / nf, alive_at[3] / nf, alive_at[4] / nf);
             println!("  decide mean {} us, max {} us | mean time of k-th death: {:?}", sum_us / dec.max(1) as u128, max_us, nth.iter().take(15).map(|d| (d / nf).round() as i64).collect::<Vec<_>>());
+            let share = |v: &Vec<f64>, lim: f64| v.iter().filter(|&&x| x <= lim).count() as f64 / nf;
+            println!("  laser by 10 s {:.2}, 20 s {:.2}, 40 s {:.2}, ever {:.2} | alive at 30/60/90 s: {:.2}/{:.2}/{:.2} with cubes {:.1}/{:.1}/{:.1}", share(&lts, 10.0), share(&lts, 20.0), share(&lts, 40.0), share(&lts, 1e9), cub[0].1 as f64 / nf, cub[1].1 as f64 / nf, cub[2].1 as f64 / nf, cub[0].0 / cub[0].1.max(1) as f64, cub[1].0 / cub[1].1.max(1) as f64, cub[2].0 / cub[2].1.max(1) as f64);
+            println!("  first 60 s: in someone's line of sight (within 200 m) {:.0}% of the time, nearest mech {:.0} m on average", 100.0 * seen[1] / seen[0].max(1.0), seen[2] / seen[0].max(1.0));
+            println!("  second weapon by 10 s {:.2}, 20 s {:.2}, 30 s {:.2}, 60 s {:.2}, ever {:.2} | first damage by 10 s {:.2}, 20 s {:.2}, 30 s {:.2}", share(&wts, 10.0), share(&wts, 20.0), share(&wts, 30.0), share(&wts, 60.0), share(&wts, 1e9), share(&fdt, 10.0), share(&fdt, 20.0), share(&fdt, 30.0));
         }
         _ => eprintln!("usage: sim map <dir> <out.ppm> | match <seed> <spec> [trace.csv] | batch <n> <seed0> <spec>"),
+    }
+    if std::env::var("SIM_AIMDIAG").is_ok() {
+        let a = AIMD.lock().unwrap();
+        for (b, name) in ["<50", "<100", "<150", "<200", "200+"].iter().enumerate() {
+            let n = a[b][0].max(1.0);
+            println!("  aim {:5} shots {:5.0} | lateral rms {:.2} m, vertical rms {:.2} m | mean signed vs target motion {:+.2} m, vs own motion {:+.2} m | target lateral speed {:.1} | off by >2 m: {:.0}%", name, a[b][0], (a[b][1] / n).sqrt(), (a[b][2] / n).sqrt(), a[b][3] / n, a[b][4] / n, a[b][5] / n, 100.0 * a[b][6] / n);
+        }
+    }
+    if std::env::var("SIM_PRED").is_ok() {
+        let acc = PRED.lock().unwrap();
+        for (k, name) in ["house", "brain"].iter().enumerate() {
+            println!("  straight-line lead would hit {:5} under fire: 50 m {:.2}, 100 m {:.2}, 150 m {:.2}  (frames {:.0})", name, acc[k][0][1] / acc[k][0][0].max(1.0), acc[k][1][1] / acc[k][1][0].max(1.0), acc[k][2][1] / acc[k][2][0].max(1.0), acc[k][1][0]);
+        }
+    }
+    if std::env::var("SIM_PROF").is_ok() {
+        let acc = PROF.lock().unwrap();
+        for (b, name) in ["<40", "<80", "<120", "<200"].iter().enumerate() {
+            let a = acc[b];
+            let f = a[0].max(1.0);
+            println!("  prof {:5} s{:.0} close{:.1} lat{:.1} spd{:.1} bst{:.2} air{:.2} shots/s{:.2} hits/s{:.2}", name, a[0] / 10.0, a[1] / f, a[2] / f, a[3] / f, a[4] / f, a[5] / f, a[6] / (f / 10.0), a[7] / (f / 10.0));
+        }
     }
 }
 // (debug helper appended) print a patch of the nav grid
