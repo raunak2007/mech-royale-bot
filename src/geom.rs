@@ -45,6 +45,26 @@ pub struct Map {
     pub cbase: Vec<f32>,
     pub ctop: Vec<f32>,
     pub prisms: Vec<Prism>,
+    /// flat roof region of each vertex (0 = none) and its distance to that region's edge
+    pub roof_id: Vec<u32>,
+    pub roof_edge: Vec<f32>,
+    pub roofs: Vec<Roof>,
+}
+
+/// A flat stretch of rooftop a mech can stand on.
+#[derive(Clone, Debug)]
+pub struct Roof {
+    pub id: u32,
+    /// roof height (z of the surface)
+    pub top: f32,
+    /// height above the ground around it
+    pub rise: f32,
+    pub area: f32,
+    /// the point farthest from every edge, and that distance
+    pub best: (f64, f64),
+    pub depth: f32,
+    /// ground points just outside the wall from which to jet up: (x, y, ground z)
+    pub access: Vec<(f64, f64, f32)>,
 }
 
 /// Metres of crown a sight line can cross before it is blocked (protocol §8: soft canopy).
@@ -237,7 +257,8 @@ impl Map {
                 }
             }
         }
-        Ok(Map { min_x, min_y, nx, ny, bx0, bx1, by0, by1, terr, top, ebase, etop, wall, wdist, walk, cbase, ctop, prisms })
+        let (roof_id, roof_edge, roofs) = find_roofs(nx, ny, min_x, min_y, &terr, &top, &wall, &wdist, &ebase);
+        Ok(Map { min_x, min_y, nx, ny, bx0, bx1, by0, by1, terr, top, ebase, etop, wall, wdist, walk, cbase, ctop, prisms, roof_id, roof_edge, roofs })
     }
 
     #[inline]
@@ -482,6 +503,112 @@ impl Map {
         }
         None
     }
+}
+
+/// Group building vertices into flat roof regions and measure each one.
+#[allow(clippy::too_many_arguments)]
+fn find_roofs(nx: usize, ny: usize, min_x: f64, min_y: f64, terr: &[f32], top: &[f32], wall: &[u8], wdist: &[f32], ebase: &[f32]) -> (Vec<u32>, Vec<f32>, Vec<Roof>) {
+    let n = nx * ny;
+    let mut roof_id = vec![0u32; n];
+    let mut roof_edge = vec![0f32; n];
+    let mut roofs: Vec<Roof> = Vec::new();
+    let is_roof = |v: usize| wall[v] != 0 && top[v] > terr[v] + 6.0 && !ebase[v].is_finite();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut cells: Vec<usize> = Vec::new();
+    for s in 0..n {
+        if roof_id[s] != 0 || !is_roof(s) {
+            continue;
+        }
+        let i0 = s % nx;
+        let j0 = s / nx;
+        if i0 < 2 || j0 < 2 || i0 + 2 >= nx || j0 + 2 >= ny {
+            continue;
+        }
+        let id = roofs.len() as u32 + 1;
+        cells.clear();
+        roof_id[s] = id;
+        stack.push(s);
+        let (mut ax, mut bx, mut ay, mut by) = (i0, i0, j0, j0);
+        while let Some(c) = stack.pop() {
+            cells.push(c);
+            let (i, j) = (c % nx, c / nx);
+            ax = ax.min(i);
+            bx = bx.max(i);
+            ay = ay.min(j);
+            by = by.max(j);
+            for (di, dj) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+                let (ui, uj) = (i as i32 + di, j as i32 + dj);
+                if ui < 1 || uj < 1 || ui as usize + 1 >= nx || uj as usize + 1 >= ny {
+                    continue;
+                }
+                let u = uj as usize * nx + ui as usize;
+                if roof_id[u] == 0 && is_roof(u) && (top[u] - top[c]).abs() <= 0.75 {
+                    roof_id[u] = id;
+                    stack.push(u);
+                }
+            }
+        }
+        // distance to the region's edge, on the bounding box padded by one
+        let (w, h) = (bx - ax + 3, by - ay + 3);
+        let mut mask = vec![1u8; w * h];
+        for &c in &cells {
+            let (i, j) = (c % nx - ax + 1, c / nx - ay + 1);
+            mask[j * w + i] = 0;
+        }
+        let d = edt(&mask, w, h);
+        let mut best = (0f32, s);
+        let mut sum_top = 0f64;
+        for &c in &cells {
+            let (i, j) = (c % nx - ax + 1, c / nx - ay + 1);
+            let dv = d[j * w + i];
+            roof_edge[c] = dv;
+            if dv > best.0 {
+                best = (dv, c);
+            }
+            sum_top += top[c] as f64;
+        }
+        let rtop = (sum_top / cells.len() as f64) as f32;
+        // ground just outside the wall: walk outward from edge cells until there is room to stand
+        let mut access: Vec<(f64, f64, f32)> = Vec::new();
+        let mut min_ground = f32::INFINITY;
+        for &c in &cells {
+            if roof_edge[c] > 1.5 {
+                continue;
+            }
+            let (i, j) = ((c % nx) as i32, (c / nx) as i32);
+            for (di, dj) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
+                for step in 3..=6 {
+                    let (ui, uj) = (i + di * step, j + dj * step);
+                    if ui < 1 || uj < 1 || ui as usize + 1 >= nx || uj as usize + 1 >= ny {
+                        break;
+                    }
+                    let u = uj as usize * nx + ui as usize;
+                    if wall[u] != 0 {
+                        break;
+                    }
+                    if wdist[u] >= 3.3 && wdist[u] <= 5.5 {
+                        let p = (min_x + ui as f64, min_y + uj as f64, terr[u]);
+                        if !access.iter().any(|q| (q.0 - p.0).hypot(q.1 - p.1) < 10.0) {
+                            access.push(p);
+                            min_ground = min_ground.min(terr[u]);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        let rise = if min_ground.is_finite() { rtop - min_ground } else { rtop - terr[best.1] };
+        roofs.push(Roof {
+            id,
+            top: rtop,
+            rise,
+            area: cells.len() as f32,
+            best: (min_x + (best.1 % nx) as f64, min_y + (best.1 / nx) as f64),
+            depth: best.0,
+            access,
+        });
+    }
+    (roof_id, roof_edge, roofs)
 }
 
 /// Exact Euclidean distance transform (Felzenszwalb & Huttenlocher), distances in cells.

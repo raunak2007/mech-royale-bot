@@ -49,7 +49,7 @@ fn make(spec: &Spec, map: &Arc<Map>, id: usize, seed: u64) -> Box<dyn Ctl> {
         }
         "example" => Box::new(Example::new()),
         _ => {
-            let mut skill = 0.02;
+            let mut skill = 0.008;
             let mut aggro = 200.0;
             for line in spec.params.lines() {
                 if let Some((k, v)) = line.split_once('=') {
@@ -72,8 +72,20 @@ fn make(spec: &Spec, map: &Arc<Map>, id: usize, seed: u64) -> Box<dyn Ctl> {
                     if k.trim() == "hunt" {
                         h.hunt = v.trim() != "0";
                     }
+                    if k.trim() == "roam" {
+                        h.roam = v.trim().parse().unwrap_or(h.roam);
+                    }
+                    if k.trim() == "push" {
+                        h.push = v.trim().parse().unwrap_or(h.push);
+                    }
                     if k.trim() == "focus" {
                         h.focus = v.trim().parse().unwrap_or(-1);
+                    }
+                    if k.trim() == "gate" {
+                        h.gate = v.trim().parse().unwrap_or(h.gate);
+                    }
+                    if k.trim() == "retreat" {
+                        h.retreat = v.trim().parse().unwrap_or(h.retreat);
                     }
                 }
             }
@@ -227,7 +239,61 @@ fn main() {
                 println!("  comp {} size {} e.g. at {:?}", k, n, nav.pos_of(c as u32));
             }
         }
+        "roofs" => {
+            let t0 = std::time::Instant::now();
+            let m = Map::load("arena");
+            println!("map load incl. roofs: {:?}; regions {}", t0.elapsed(), m.roofs.len());
+            let mut good: Vec<&mechbot::geom::Roof> = m.roofs.iter().filter(|r| r.depth >= 7.0 && r.rise >= 9.0 && !r.access.is_empty()).collect();
+            good.sort_by(|a, b| b.depth.partial_cmp(&a.depth).unwrap());
+            println!("usable (depth>=7, rise>=9, has access): {}", good.len());
+            let climbable = good.iter().filter(|r| r.rise <= 48.0).count();
+            println!("  of which rise<=48 m: {}", climbable);
+            for r in good.iter().take(14) {
+                println!("  roof {} top {:.1} rise {:.1} depth {:.1} area {:.0} best ({:.0},{:.0}) access {}", r.id, r.top, r.rise, r.depth, r.area, r.best.0, r.best.1, r.access.len());
+            }
+            let hist = |lo: f32, hi: f32| good.iter().filter(|r| r.rise >= lo && r.rise < hi).count();
+            println!("rise histogram: 9-15: {}, 15-25: {}, 25-35: {}, 35-48: {}, 48+: {}", hist(9.0, 15.0), hist(15.0, 25.0), hist(25.0, 35.0), hist(35.0, 48.0), hist(48.0, 999.0));
+        }
         "patch" => dump_patch(args[2].parse().unwrap(), args[3].parse().unwrap()),
+        "replay" => {
+            // feed a recorded stream of real observations to the brain and print what it decides
+            let text = std::fs::read_to_string(&args[2]).unwrap();
+            let map = Arc::new(Map::load("arena"));
+            let mut prm = Params::default();
+            prm.apply(&args.get(3).cloned().unwrap_or_default().replace(';', "\n"));
+            prm.debug = 1.0;
+            let mut brain: Option<Brain> = None;
+            for line in text.lines() {
+                let m = match json::parse(line) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                match m.get("type").s() {
+                    "hello" => brain = Some(Brain::new(&m, map.clone(), prm.clone())),
+                    "obs" => {
+                        if let Some(b) = brain.as_mut() {
+                            let a = b.decide(&m);
+                            let me = m.get("self");
+                            println!(
+                                "t={:5.1} hp={:6.0} mv=({:5.2},{:5.2}) boost={} jump={} aim=({:5.2},{:5.2}) fire={:?} rl={} | {}",
+                                m.get("t").f(),
+                                me.get("hp").f(),
+                                a.mv[0],
+                                a.mv[1],
+                                a.boost as u8,
+                                a.jump as u8,
+                                a.aim[0],
+                                a.aim[1],
+                                a.fire,
+                                a.reload as u8,
+                                a.label
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         "match" => {
             let map = Arc::new(Map::load("arena"));
             let seed: u64 = args[2].parse().unwrap();
