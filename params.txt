@@ -1,13 +1,16 @@
 # Tunables for the bot. Read once at startup from the folder the binary is in.
 # Lines are key=value; anything after # is ignored. Delete a line to get the built-in default.
 
-ambush=1          # 0 never fire first | 1 also finish weak targets | 2 also open on unaware targets
-farm=1            # 1 shoot crates and idle drones for cubes when nobody is around | 0 stay quiet
-cover_reach=90    # run for cover only if it is within this many metres of walking; else stand and fight
+# v2a: "statue with a brain". Does nothing until the zone or an attacker forces it to.
+lazy=1            # move for the zone only when its wall is about to arrive, then walk in once
+relocate=0        # walking metres it may move to a better hiding spot when nothing is happening (0 = stay put)
+ambush=0          # 0 never fire first | 1 also finish weak targets | 2 also open on unaware targets
+farm=0            # 1 shoot crates and idle drones for cubes when nobody is around | 0 stay quiet
+sees_engage=0     # 1 open fire on a mech that can see us when the duel looks good | 0 wait until it attacks
+pb_range=0        # open fire on any mech closer than this many metres (0 = wait until it attacks)
+end_radius=1      # once the next circle is this small, go and hold its centre
+cover_reach=90    # when attacked, run for cover only if it is within this many metres of walking; else fight
 fight_margin=1.15 # take a 1v1 only when our time-to-kill beats theirs by this factor
-finish_hp=420     # "weak target" threshold for ambush=1
-center_avoid=50   # how strongly to stay out of the middle of the next circle early on
 w_expo=60         # preference for boxed-in spots over open ground
 w_vis=130         # penalty for standing where a known enemy can see us
 w_detour=0.3      # penalty for hiding spots that are a long walk from the middle of the next circle
-end_radius=30     # once the next circle is this small, go and hold its centre

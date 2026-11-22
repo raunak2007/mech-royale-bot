@@ -215,6 +215,18 @@ pub struct Params {
     pub spin: f64,
     pub cover_reach: f64,
     pub w_detour: f64,
+    /// 1: move for the zone only when its edge is about to arrive, instead of at once
+    pub lazy: f64,
+    /// how far (walking metres) we will move to a better hiding spot when nothing is happening; 0 = stay put
+    pub relocate: f64,
+    /// open fire on a mech that can see us if the duel looks good (0 = wait until it attacks)
+    pub sees_engage: f64,
+    /// open fire on any mech closer than this (0 = wait until it attacks)
+    pub pb_range: f64,
+    /// diagnostics: idle = send nothing but the tick; nomove = never move; pacifist = never fire
+    pub idle: f64,
+    pub nomove: f64,
+    pub pacifist: f64,
     pub debug: f64,
 }
 impl Default for Params {
@@ -235,6 +247,13 @@ impl Default for Params {
             spin: 1.6,
             cover_reach: 90.0,
             w_detour: 0.3,
+            lazy: 0.0,
+            relocate: 170.0,
+            sees_engage: 1.0,
+            pb_range: 38.0,
+            idle: 0.0,
+            nomove: 0.0,
+            pacifist: 0.0,
             debug: 0.0,
         }
     }
@@ -268,6 +287,13 @@ impl Params {
                 "spin" => self.spin = v,
                 "cover_reach" => self.cover_reach = v,
                 "w_detour" => self.w_detour = v,
+                "lazy" => self.lazy = v,
+                "relocate" => self.relocate = v,
+                "sees_engage" => self.sees_engage = v,
+                "pb_range" => self.pb_range = v,
+                "idle" => self.idle = v,
+                "nomove" => self.nomove = v,
+                "pacifist" => self.pacifist = v,
                 "debug" => self.debug = v,
                 _ => {}
             }
@@ -567,6 +593,9 @@ pub struct Brain {
     take_fail_t: f64,
     take_fail_id: i64,
     fly_goal: Option<(f64, f64)>,
+    zone_plen: f64,
+    zone_plen_t: f64,
+    zone_moving: bool,
     npc_dmg_t: f64,
     jink_dir: f64,
     jink_until: f64,
@@ -666,6 +695,9 @@ impl Brain {
             take_fail_t: -100.0,
             take_fail_id: -1,
             fly_goal: None,
+            zone_plen: 0.0,
+            zone_plen_t: -100.0,
+            zone_moving: false,
             npc_dmg_t: -100.0,
             jink_dir: 1.0,
             jink_until: -1.0,
@@ -1060,7 +1092,7 @@ impl Brain {
         let threats = self.build_threats(me, t, fight_id);
         let margin = (self.prm.edge_margin * zone.nr).clamp(3.0, 15.0);
         let safe_r = (zone.nr - margin).max(0.0);
-        let max_cost = if vis_mult > 1.5 { 130.0 } else { 170.0 };
+        let max_cost = if vis_mult > 1.5 { 130.0 } else { (self.prm.relocate as f32).clamp(20.0, 170.0) };
         let p = (me.pos[0], me.pos[1]);
         let pc = std::mem::take(&mut self.path_cost);
         let ok = self.nav.flood(p, need, max_cost, Some(&pc)).is_some();
@@ -1273,6 +1305,10 @@ impl Brain {
         let t0 = std::time::Instant::now();
         let t = o.get("t").f();
         let me = self.read_self(o);
+        if self.prm.idle > 0.5 {
+            // diagnostic statue: hold the spawn facing, do nothing at all
+            return Action { aim: me.aim, ..Default::default() };
+        }
         self.update_tracks(o, t);
         self.update_items(o, &me, t);
         self.read_events(o, &me, t);
@@ -1414,14 +1450,14 @@ impl Brain {
             let finish = e.hp <= self.prm.finish_hp * cube_mult && (inf.d < 130.0 || (me.slot_of(LASER).is_some() && inf.d < 250.0));
             let engage = inf.hostile
                 || endgame
-                || inf.d < 38.0
-                || (inf.sees && inf.d < 175.0 && favorable)
+                || inf.d < self.prm.pb_range
+                || (self.prm.sees_engage > 0.5 && inf.sees && inf.d < 175.0 && favorable)
                 || (self.prm.ambush >= 1.0 && finish)
                 || (self.prm.ambush >= 2.0 && unaware && inf.d < 140.0 && hp_frac > 0.8 && favorable && infos.len() <= 2);
             if !engage {
                 continue;
             }
-            if recovering && !inf.hostile && !endgame && inf.d > 38.0 {
+            if recovering && !inf.hostile && !endgame && inf.d > self.prm.pb_range {
                 continue;
             }
             let mut sc = 0.0;
@@ -1481,11 +1517,47 @@ impl Brain {
         let safe_r = (zone.nr - margin).max(0.0);
         let me_out = (d2(&me.pos, &zone.nc) - safe_r).max(0.0);
         let zone_left = zone.time_left(t, &[me.pos[0], me.pos[1]]);
-        // walking routes bend around buildings: budget well over the straight-line time
-        let zone_urgent = me_out > 0.0 && (!me.in_zone || zone_left < me_out / me.walk_speed * 2.2 + 8.0);
+        let lazy = self.prm.lazy > 0.5;
+        let (zone_urgent, go_now) = if !lazy {
+            // walking routes bend around buildings: budget well over the straight-line time
+            (me_out > 0.0 && (!me.in_zone || zone_left < me_out / me.walk_speed * 2.2 + 8.0), me_out > 3.0)
+        } else if me_out <= 3.0 {
+            self.zone_moving = false;
+            (false, false)
+        } else {
+            // Stay put until the wall is nearly on us, then walk in once. Know the real walking distance.
+            if t - self.zone_plen_t > 2.0 || self.zone_plen <= 0.0 {
+                let need = (me.radius + 0.9) as f32;
+                let pc = std::mem::take(&mut self.path_cost);
+                let disk_r = (safe_r - 5.0).max(1.0);
+                let found = self.nav.path_to_disk((me.pos[0], me.pos[1]), (zone.nc[0], zone.nc[1]), disk_r, need, Some(&pc), 30_000);
+                self.path_cost = pc;
+                self.zone_plen = match found {
+                    Some(cells) => {
+                        let mut prev = (me.pos[0], me.pos[1]);
+                        let mut sum = 0.0;
+                        for c in cells {
+                            let q = self.nav.pos_of(c);
+                            sum += hyp(q.0 - prev.0, q.1 - prev.1);
+                            prev = q;
+                        }
+                        sum.max(me_out)
+                    }
+                    None => me_out * 1.6 + 20.0,
+                };
+                self.zone_plen_t = t;
+            }
+            let tw = self.zone_plen / me.walk_speed;
+            let hot = zone.dps >= 60.0;
+            let lead = 3.0 + (tw - me_out / me.walk_speed).clamp(0.0, 12.0) * 0.5 + if hot { 2.5 } else { 0.0 };
+            let t_dep = zone.t1 - tw * 1.25 - if hot { 8.0 } else { 4.0 };
+            let go = !me.in_zone || zone_left < lead || t >= t_dep || self.zone_moving;
+            self.zone_moving = go;
+            (!me.in_zone || zone_left < lead * 0.5, go)
+        };
         if endgame {
             mode = Mode::End;
-        } else if zone_urgent || (me_out > 3.0 && mode != Mode::Fight) {
+        } else if zone_urgent || (go_now && mode != Mode::Fight) {
             // outside the next circle: get inside first, then look for a spot
             mode = Mode::ZoneRun;
         }
@@ -1542,13 +1614,20 @@ impl Brain {
                 let left = zone.time_left(t, &p2);
                 let plen = self.path_len(&me).max(rem);
                 let need_t = plen / me.walk_speed;
-                boost = !me.in_zone || left < need_t + 5.0 || under_fire;
+                boost = if lazy { !me.in_zone || left < 1.5 || under_fire } else { !me.in_zone || left < need_t + 5.0 || under_fire };
             }
             Mode::Hide | Mode::Flee | Mode::Fight => {
                 let threatened = !hostile_los.is_empty() || under_fire;
-                let period = if threatened { 0.2 } else { 0.45 };
+                if !threatened && self.prm.relocate <= 0.0 {
+                    // statue: nothing is happening, so do nothing
+                    self.path.clear();
+                    self.goal = None;
+                    self.plan_t = t;
+                    self.flee_planned = false;
+                }
+                let period = if threatened { 0.2 } else if self.prm.relocate <= 0.0 { 1e9 } else { 0.45 };
                 let force = (threatened && !self.flee_planned) || self.mode == Mode::End || self.mode == Mode::ZoneRun;
-                if t - self.plan_t >= period || force {
+                if (t - self.plan_t >= period || force) && (threatened || self.prm.relocate > 0.0) {
                     let loot_ok = mode == Mode::Hide && !under_fire && hostile_los.is_empty();
                     // while threatened always plan for cover (ignoring nobody), so we know if any is near
                     let (vm, fid) = if threatened { (2.5, -1) } else { (vis_mult, fight_id) };
@@ -1613,7 +1692,8 @@ impl Brain {
                     _ => {
                         // Hide: walk; creep when someone is close enough to hear steps
                         let near_enemy = infos.iter().any(|f| f.d < 75.0 && f.listed);
-                        if near_enemy && !under_fire {
+                        if (near_enemy || lazy) && !under_fire {
+                            // below the footstep threshold: silent
                             speed_frac = (4.7 / me.walk_speed).min(1.0);
                         }
                         let left = zone.time_left(t, &p2);
@@ -1893,6 +1973,15 @@ impl Brain {
             }
         }
 
+        if self.prm.nomove > 0.5 {
+            act.mv = [0.0, 0.0];
+            act.boost = false;
+            act.jump = false;
+        }
+        if self.prm.pacifist > 0.5 {
+            act.fire = [false, false];
+            act.reload = false;
+        }
         if self.prm.debug > 0.0 {
             let _ = write!(label, "{:?} hp{:.0} a{} h{} s{}", mode, me.hp, alive, hostile_los.len(), seen_by.len());
             act.label = label;
