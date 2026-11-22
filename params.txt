@@ -1,8 +1,8 @@
 # Tunables for the bot. Read once at startup from the folder the binary is in.
 # Lines are key=value; anything after # is ignored. Delete a line to get the built-in default.
 
-ambush=1          # 0 never fire first | 1 also finish weak targets | 2 also open on unaware targets
-farm=1            # 1 shoot crates and idle drones for cubes when nobody is around | 0 stay quiet
+ambush=0          # 0 never fire first | 1 also finish weak targets | 2 also open on unaware targets
+farm=0            # 1 shoot crates and idle drones for cubes when nobody is around | 0 stay quiet
 cover_reach=90    # run for cover only if it is within this many metres of walking; else stand and fight
 fight_margin=1.15 # take a 1v1 only when our time-to-kill beats theirs by this factor
 finish_hp=420     # "weak target" threshold for ambush=1

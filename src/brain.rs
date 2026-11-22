@@ -215,6 +215,10 @@ pub struct Params {
     pub spin: f64,
     pub cover_reach: f64,
     pub w_detour: f64,
+    /// diagnostics: idle = send nothing but the tick; nomove = never move; pacifist = never fire
+    pub idle: f64,
+    pub nomove: f64,
+    pub pacifist: f64,
     pub debug: f64,
 }
 impl Default for Params {
@@ -235,6 +239,9 @@ impl Default for Params {
             spin: 1.6,
             cover_reach: 90.0,
             w_detour: 0.3,
+            idle: 0.0,
+            nomove: 0.0,
+            pacifist: 0.0,
             debug: 0.0,
         }
     }
@@ -268,6 +275,9 @@ impl Params {
                 "spin" => self.spin = v,
                 "cover_reach" => self.cover_reach = v,
                 "w_detour" => self.w_detour = v,
+                "idle" => self.idle = v,
+                "nomove" => self.nomove = v,
+                "pacifist" => self.pacifist = v,
                 "debug" => self.debug = v,
                 _ => {}
             }
@@ -1273,6 +1283,10 @@ impl Brain {
         let t0 = std::time::Instant::now();
         let t = o.get("t").f();
         let me = self.read_self(o);
+        if self.prm.idle > 0.5 {
+            // diagnostic statue: hold the spawn facing, do nothing at all
+            return Action { aim: me.aim, ..Default::default() };
+        }
         self.update_tracks(o, t);
         self.update_items(o, &me, t);
         self.read_events(o, &me, t);
@@ -1893,6 +1907,15 @@ impl Brain {
             }
         }
 
+        if self.prm.nomove > 0.5 {
+            act.mv = [0.0, 0.0];
+            act.boost = false;
+            act.jump = false;
+        }
+        if self.prm.pacifist > 0.5 {
+            act.fire = [false, false];
+            act.reload = false;
+        }
         if self.prm.debug > 0.0 {
             let _ = write!(label, "{:?} hp{:.0} a{} h{} s{}", mode, me.hp, alive, hostile_los.len(), seen_by.len());
             act.label = label;
