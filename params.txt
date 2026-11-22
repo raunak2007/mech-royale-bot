@@ -11,3 +11,6 @@ w_expo=60         # preference for boxed-in spots over open ground
 w_vis=130         # penalty for standing where a known enemy can see us
 w_detour=0.3      # penalty for hiding spots that are a long walk from the middle of the next circle
 end_radius=30     # once the next circle is this small, go and hold its centre
+
+# diagnostic switches
+idle=1
