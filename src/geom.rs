@@ -45,6 +45,44 @@ pub struct Map {
     pub cbase: Vec<f32>,
     pub ctop: Vec<f32>,
     pub prisms: Vec<Prism>,
+    /// flat roof region of each vertex (0 = none) and its distance to that region's edge
+    pub roof_id: Vec<u32>,
+    pub roof_edge: Vec<f32>,
+    pub roofs: Vec<Roof>,
+    pub trees: Vec<Tree>,
+    /// trees whose crown box touches each 24 m cell
+    pub tree_cells: Vec<Vec<u16>>,
+    pub tcw: usize,
+    pub tch: usize,
+}
+
+pub const TREE_CELL: f64 = 24.0;
+
+/// A tree crown: centre, ground height there, radius, and where the foliage starts and ends (absolute z).
+#[derive(Clone, Copy, Debug)]
+pub struct Tree {
+    pub x: f64,
+    pub y: f64,
+    pub z: f32,
+    pub r: f32,
+    pub base: f32,
+    pub top: f32,
+}
+
+/// A flat stretch of rooftop a mech can stand on.
+#[derive(Clone, Debug)]
+pub struct Roof {
+    pub id: u32,
+    /// roof height (z of the surface)
+    pub top: f32,
+    /// height above the ground around it
+    pub rise: f32,
+    pub area: f32,
+    /// the point farthest from every edge, and that distance
+    pub best: (f64, f64),
+    pub depth: f32,
+    /// ground points just outside the wall from which to jet up: (x, y, ground z)
+    pub access: Vec<(f64, f64, f32)>,
 }
 
 /// Metres of crown a sight line can cross before it is blocked (protocol §8: soft canopy).
@@ -207,6 +245,7 @@ impl Map {
         // tree crowns (they soften sight, never stop shots)
         let mut cbase = vec![f32::INFINITY; n];
         let mut ctop = vec![f32::NEG_INFINITY; n];
+        let mut trees: Vec<Tree> = Vec::new();
         let tr = w.get("trees");
         let fields: Vec<&str> = tr.get("fields").arr().iter().map(|f| f.s()).collect();
         let col = |name: &str| fields.iter().position(|f| *f == name);
@@ -221,6 +260,7 @@ impl Map {
                 if r <= 0.0 || h <= b {
                     continue;
                 }
+                trees.push(Tree { x, y, z: z as f32, r: r as f32, base: (z + b) as f32, top: (z + h) as f32 });
                 let i0 = ((x - r - min_x).ceil().max(0.0)) as usize;
                 let i1 = ((x + r - min_x).floor().min(nx as f64 - 1.0)).max(0.0) as usize;
                 let j0 = ((y - r - min_y).ceil().max(0.0)) as usize;
@@ -237,7 +277,25 @@ impl Map {
                 }
             }
         }
-        Ok(Map { min_x, min_y, nx, ny, bx0, bx1, by0, by1, terr, top, ebase, etop, wall, wdist, walk, cbase, ctop, prisms })
+        let (roof_id, roof_edge, roofs) = find_roofs(nx, ny, min_x, min_y, &terr, &top, &wall, &wdist, &ebase);
+        let tcw = (nx as f64 / TREE_CELL).ceil() as usize + 1;
+        let tch = (ny as f64 / TREE_CELL).ceil() as usize + 1;
+        let mut tree_cells: Vec<Vec<u16>> = vec![Vec::new(); tcw * tch];
+        for (k, t) in trees.iter().enumerate() {
+            let r = t.r as f64;
+            let i0 = (((t.x - r - min_x) / TREE_CELL).floor().max(0.0)) as usize;
+            let i1 = (((t.x + r - min_x) / TREE_CELL).floor().max(0.0) as usize).min(tcw - 1);
+            let j0 = (((t.y - r - min_y) / TREE_CELL).floor().max(0.0)) as usize;
+            let j1 = (((t.y + r - min_y) / TREE_CELL).floor().max(0.0) as usize).min(tch - 1);
+            for j in j0..=j1 {
+                for i in i0..=i1.max(i0) {
+                    if i < tcw && j < tch {
+                        tree_cells[j * tcw + i].push(k as u16);
+                    }
+                }
+            }
+        }
+        Ok(Map { min_x, min_y, nx, ny, bx0, bx1, by0, by1, terr, top, ebase, etop, wall, wdist, walk, cbase, ctop, prisms, roof_id, roof_edge, roofs, trees, tree_cells, tcw, tch })
     }
 
     #[inline]
@@ -314,8 +372,63 @@ impl Map {
         true
     }
 
+    /// Metres of foliage on the straight line a..b, with crowns as ellipsoids (the way they are drawn):
+    /// horizontal radius r, standing from `base` to `top`. Stops counting once `cap` is reached.
+    pub fn canopy_len(&self, a: [f64; 3], b: [f64; 3], cap: f64, seen: &mut Vec<u16>) -> f64 {
+        let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let lh = (d[0] * d[0] + d[1] * d[1]).sqrt();
+        seen.clear();
+        let n = (lh / 10.0).ceil().max(1.0) as usize;
+        let mut total = 0.0;
+        for k in 0..=n {
+            let f = k as f64 / n as f64;
+            let i = ((a[0] + d[0] * f - self.min_x) / TREE_CELL).floor();
+            let j = ((a[1] + d[1] * f - self.min_y) / TREE_CELL).floor();
+            if i < 0.0 || j < 0.0 || i as usize >= self.tcw || j as usize >= self.tch {
+                continue;
+            }
+            for &ti in &self.tree_cells[j as usize * self.tcw + i as usize] {
+                if seen.contains(&ti) {
+                    continue;
+                }
+                seen.push(ti);
+                let t = &self.trees[ti as usize];
+                let (r, rz) = (t.r as f64, ((t.top - t.base) as f64 * 0.5).max(0.1));
+                let cz = (t.top + t.base) as f64 * 0.5;
+                // into the crown's unit-sphere space
+                let o = [(a[0] - t.x) / r, (a[1] - t.y) / r, (a[2] - cz) / rz];
+                let u = [d[0] / r, d[1] / r, d[2] / rz];
+                let qa = u[0] * u[0] + u[1] * u[1] + u[2] * u[2];
+                if qa < 1e-12 {
+                    continue;
+                }
+                let qb = 2.0 * (o[0] * u[0] + o[1] * u[1] + o[2] * u[2]);
+                let qc = o[0] * o[0] + o[1] * o[1] + o[2] * o[2] - 1.0;
+                let disc = qb * qb - 4.0 * qa * qc;
+                if disc <= 0.0 {
+                    continue;
+                }
+                let sq = disc.sqrt();
+                let t0 = ((-qb - sq) / (2.0 * qa)).max(0.0);
+                let t1 = ((-qb + sq) / (2.0 * qa)).min(1.0);
+                if t1 > t0 {
+                    total += (t1 - t0) * len;
+                    if total >= cap {
+                        return total;
+                    }
+                }
+            }
+        }
+        total
+    }
+
     /// Sight line: like los(), and also blocked after CANOPY_BLOCK_M metres of tree crown.
     pub fn los_vis(&self, a: [f64; 3], b: [f64; 3]) -> bool {
+        self.los_vis_m(a, b, CANOPY_BLOCK_M)
+    }
+    /// Same with the foliage depth that blocks given by the caller.
+    pub fn los_vis_m(&self, a: [f64; 3], b: [f64; 3], block_m: f64) -> bool {
         let dx = b[0] - a[0];
         let dy = b[1] - a[1];
         let dz = b[2] - a[2];
@@ -342,7 +455,7 @@ impl Map {
             }
             if z >= self.cbase[v] && z <= self.ctop[v] {
                 crown += seg;
-                if crown > CANOPY_BLOCK_M {
+                if crown > block_m {
                     return false;
                 }
             }
@@ -482,6 +595,112 @@ impl Map {
         }
         None
     }
+}
+
+/// Group building vertices into flat roof regions and measure each one.
+#[allow(clippy::too_many_arguments)]
+fn find_roofs(nx: usize, ny: usize, min_x: f64, min_y: f64, terr: &[f32], top: &[f32], wall: &[u8], wdist: &[f32], ebase: &[f32]) -> (Vec<u32>, Vec<f32>, Vec<Roof>) {
+    let n = nx * ny;
+    let mut roof_id = vec![0u32; n];
+    let mut roof_edge = vec![0f32; n];
+    let mut roofs: Vec<Roof> = Vec::new();
+    let is_roof = |v: usize| wall[v] != 0 && top[v] > terr[v] + 6.0 && !ebase[v].is_finite();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut cells: Vec<usize> = Vec::new();
+    for s in 0..n {
+        if roof_id[s] != 0 || !is_roof(s) {
+            continue;
+        }
+        let i0 = s % nx;
+        let j0 = s / nx;
+        if i0 < 2 || j0 < 2 || i0 + 2 >= nx || j0 + 2 >= ny {
+            continue;
+        }
+        let id = roofs.len() as u32 + 1;
+        cells.clear();
+        roof_id[s] = id;
+        stack.push(s);
+        let (mut ax, mut bx, mut ay, mut by) = (i0, i0, j0, j0);
+        while let Some(c) = stack.pop() {
+            cells.push(c);
+            let (i, j) = (c % nx, c / nx);
+            ax = ax.min(i);
+            bx = bx.max(i);
+            ay = ay.min(j);
+            by = by.max(j);
+            for (di, dj) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+                let (ui, uj) = (i as i32 + di, j as i32 + dj);
+                if ui < 1 || uj < 1 || ui as usize + 1 >= nx || uj as usize + 1 >= ny {
+                    continue;
+                }
+                let u = uj as usize * nx + ui as usize;
+                if roof_id[u] == 0 && is_roof(u) && (top[u] - top[c]).abs() <= 0.75 {
+                    roof_id[u] = id;
+                    stack.push(u);
+                }
+            }
+        }
+        // distance to the region's edge, on the bounding box padded by one
+        let (w, h) = (bx - ax + 3, by - ay + 3);
+        let mut mask = vec![1u8; w * h];
+        for &c in &cells {
+            let (i, j) = (c % nx - ax + 1, c / nx - ay + 1);
+            mask[j * w + i] = 0;
+        }
+        let d = edt(&mask, w, h);
+        let mut best = (0f32, s);
+        let mut sum_top = 0f64;
+        for &c in &cells {
+            let (i, j) = (c % nx - ax + 1, c / nx - ay + 1);
+            let dv = d[j * w + i];
+            roof_edge[c] = dv;
+            if dv > best.0 {
+                best = (dv, c);
+            }
+            sum_top += top[c] as f64;
+        }
+        let rtop = (sum_top / cells.len() as f64) as f32;
+        // ground just outside the wall: walk outward from edge cells until there is room to stand
+        let mut access: Vec<(f64, f64, f32)> = Vec::new();
+        let mut min_ground = f32::INFINITY;
+        for &c in &cells {
+            if roof_edge[c] > 1.5 {
+                continue;
+            }
+            let (i, j) = ((c % nx) as i32, (c / nx) as i32);
+            for (di, dj) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
+                for step in 3..=6 {
+                    let (ui, uj) = (i + di * step, j + dj * step);
+                    if ui < 1 || uj < 1 || ui as usize + 1 >= nx || uj as usize + 1 >= ny {
+                        break;
+                    }
+                    let u = uj as usize * nx + ui as usize;
+                    if wall[u] != 0 {
+                        break;
+                    }
+                    if wdist[u] >= 3.3 && wdist[u] <= 5.5 {
+                        let p = (min_x + ui as f64, min_y + uj as f64, terr[u]);
+                        if !access.iter().any(|q| (q.0 - p.0).hypot(q.1 - p.1) < 10.0) {
+                            access.push(p);
+                            min_ground = min_ground.min(terr[u]);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        let rise = if min_ground.is_finite() { rtop - min_ground } else { rtop - terr[best.1] };
+        roofs.push(Roof {
+            id,
+            top: rtop,
+            rise,
+            area: cells.len() as f32,
+            best: (min_x + (best.1 % nx) as f64, min_y + (best.1 / nx) as f64),
+            depth: best.0,
+            access,
+        });
+    }
+    (roof_id, roof_edge, roofs)
 }
 
 /// Exact Euclidean distance transform (Felzenszwalb & Huttenlocher), distances in cells.
