@@ -121,6 +121,9 @@ pub struct Mech {
     pub dmg_taken: f64,
     pub zone_dmg: f64,
     pub stuck_ticks: u32,
+    /// gun rounds fired, and gun rounds that hit a mech
+    pub shots: u32,
+    pub hits: u32,
 }
 impl Mech {
     pub fn size(&self) -> f64 {
@@ -377,6 +380,8 @@ impl Sim {
                 dmg_taken: 0.0,
                 zone_dmg: 0.0,
                 stuck_ticks: 0,
+                shots: 0,
+                hits: 0,
             });
         }
         // crates, loot, drones
@@ -1309,6 +1314,7 @@ impl Sim {
                 let id = self.next_id;
                 self.next_id += 1;
                 self.projs.push(Proj { id, kind: 0, owner: i, pos: start, vel: [d[0] * speed, d[1] * speed, d[2] * speed], left: range, dmg, from: o });
+                self.mechs[i].shots += 1;
                 self.sound("gun", o, Some(i));
                 let mut best = 1e9;
                 for m in &self.mechs {
@@ -1480,6 +1486,7 @@ impl Sim {
                         if let Tgt::Mech(k) = tg {
                             let dd = d2(&self.mechs[k].pos, &from);
                             self.gun_hit[((dd / 50.0) as usize).min(5)] += 1;
+                            self.mechs[owner].hits += 1;
                         }
                         self.hurt(tg, dmg, "gun", Some(owner), from)
                     }
@@ -1899,6 +1906,14 @@ pub struct House {
     pub duty: f64,
     pub dodge: bool,
     pub hunt: bool,
+    /// fire only when the target has been moving steadily (0 = always fire when aligned)
+    pub gate: f64,
+    /// retreat below this HP fraction
+    pub retreat: f64,
+    tvel: [f64; 2],
+    tvel_id: i64,
+    steady_t: f64,
+    flee_until: f64,
     /// only ever target this mech id (stress test); -1 = anyone
     pub focus: i64,
     hunt_pt: (f64, f64),
@@ -1906,6 +1921,11 @@ pub struct House {
     attack_until: f64,
     rest_until: f64,
     strafe_speed: f64,
+    /// 0 = heads for the middle of the next circle when idle, 1 = roams the whole circle; values between = chance of being a roamer
+    pub roam: f64,
+    roamer: bool,
+    /// distance it tries to close to in a fight
+    pub push: f64,
 }
 impl House {
     pub fn new(map: Arc<Map>, seed: u64, skill: f64, aggro: f64) -> House {
@@ -1934,12 +1954,21 @@ impl House {
             duty: 0.5,
             dodge: true,
             hunt: true,
+            gate: 1.0,
+            retreat: 0.4,
+            tvel: [0.0; 2],
+            tvel_id: -1,
+            steady_t: 0.0,
+            flee_until: -1.0,
             focus: -1,
             hunt_pt: (0.0, 0.0),
             hunt_t: -100.0,
             attack_until: -1.0,
             rest_until: -1.0,
             strafe_speed: 1.0,
+            roam: 0.5,
+            roamer: (seed >> 17) & 1 == 1,
+            push: 50.0,
         }
     }
     fn route(&mut self, from: [f64; 2], to: (f64, f64), t: f64) {
@@ -2080,14 +2109,20 @@ impl Ctl for House {
             let c = [q[0], q[1], q[2] + 4.5];
             let vis = self.map.los(muzzle, c);
             let d = d2(&q, &p);
-            // fires in spells: a couple of seconds on, then a pause while it only dodges
-            if t > self.attack_until && t > self.rest_until {
-                let on = self.rng.range(1.2, 2.8);
-                let off = on * (1.0 - self.duty) / self.duty.max(0.05) * self.rng.range(0.6, 1.4);
-                self.attack_until = t + on;
-                self.rest_until = t + on + off;
+            // shoots when it has a good solution: the target's velocity has held steady for a moment
+            let tid = m.get("id").f() as i64;
+            if tid != self.tvel_id {
+                self.tvel_id = tid;
+                self.tvel = [v[0], v[1]];
+                self.steady_t = t;
             }
-            let attacking = t <= self.attack_until;
+            if hyp(v[0] - self.tvel[0], v[1] - self.tvel[1]) > 2.5 {
+                self.steady_t = t;
+                self.tvel = [v[0], v[1]];
+            }
+            let steady = t - self.steady_t >= 0.2 * self.gate || d < 70.0 || self.gate <= 0.0;
+            let _ = (self.attack_until, self.rest_until, self.duty);
+            let attacking = steady;
             if vis {
                 // aim noise resampled a few times a second
                 if t - self.noise_t > 0.3 {
@@ -2160,7 +2195,7 @@ impl Ctl for House {
                     self.strafe_speed = self.rng.range(0.5, 1.0);
                 }
                 let b = (q[1] - p[1]).atan2(q[0] - p[0]);
-                let radial = if d > 150.0 { 0.7 } else if d < 60.0 { -0.5 } else { 0.0 };
+                let radial = if d > self.push + 25.0 { 0.9 } else if d > self.push + 8.0 { 0.45 } else if d < self.push - 20.0 { -0.5 } else { 0.0 };
                 for _ in 0..2 {
                     let sa = b + self.strafe_dir * PI / 2.0;
                     let (sx, sy) = (sa.cos() + b.cos() * radial, sa.sin() + b.sin() * radial);
@@ -2179,6 +2214,21 @@ impl Ctl for House {
                 mv = self.follow(p2);
                 boost = energy > 50.0;
                 a.aim = [(q[1] - p[1]).atan2(q[0] - p[0]), 0.0];
+            }
+            let hpf = me.get("hp").f() / me.get("max_hp").fo(1400.0).max(1.0);
+            let hit_now = o.get("events").arr().iter().any(|e| e.get("type").s() == "damaged");
+            if hpf < self.retreat && hit_now && t > self.flee_until + 6.0 {
+                self.flee_until = t + self.rng.range(3.0, 5.0);
+            }
+            if t < self.flee_until {
+                // back off out of sight for a few seconds
+                let b = (p[1] - q[1]).atan2(p[0] - q[0]) + self.strafe_dir * 0.6;
+                let ahead = (p[0] + b.cos() * 5.0, p[1] + b.sin() * 5.0);
+                if self.map.wall_dist(ahead.0, ahead.1) >= 3.2 {
+                    mv = [b.cos(), b.sin()];
+                }
+                boost = energy > 10.0;
+                a.jump = me.get("grounded").b() && self.rng.f() < 0.05;
             }
             if must_zone {
                 self.route(p2, (nc[0], nc[1]), t);
@@ -2209,6 +2259,27 @@ impl Ctl for House {
                 } else {
                     self.hunt_t = -100.0;
                 }
+            }
+            let roamer = if self.roam >= 1.0 { true } else if self.roam <= 0.0 { false } else { self.roamer };
+            if goal.is_none() && roamer && !must_zone {
+                let zc = zone.get("center").v2();
+                let zr = zone.get("radius").f().min(520.0);
+                let far = d2(&p2, &[self.wander.0, self.wander.1]);
+                if t - self.wander_t > 25.0 || far < 15.0 || d2(&[self.wander.0, self.wander.1], &nc) > nr + 30.0 {
+                    self.wander_t = t;
+                    for _ in 0..8 {
+                        let ang = self.rng.range(-PI, PI);
+                        let r = zr.min(nr + 30.0) * self.rng.f().sqrt() * 0.9;
+                        let base = if nr < zr { nc } else { zc };
+                        let cand = (base[0] + ang.cos() * r, base[1] + ang.sin() * r);
+                        if self.map.wall_dist(cand.0, cand.1) >= 3.5 {
+                            self.wander = cand;
+                            break;
+                        }
+                    }
+                }
+                goal = Some(self.wander);
+                boost = energy > 35.0;
             }
             if goal.is_none() {
                 let dc = d2(&p2, &nc);
