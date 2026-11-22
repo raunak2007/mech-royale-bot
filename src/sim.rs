@@ -15,6 +15,8 @@ const DT: f64 = 0.05;
 
 pub trait Ctl {
     fn act(&mut self, obs: &J) -> Action;
+    /// squad orders for house bots: am I hunting, and where the squad last saw the subject (pos, vel, time)
+    fn squad(&mut self, _hunter: bool, _known: Option<([f64; 3], [f64; 3], f64)>) {}
 }
 impl Ctl for Brain {
     fn act(&mut self, obs: &J) -> Action {
@@ -121,6 +123,11 @@ pub struct Mech {
     pub dmg_taken: f64,
     pub zone_dmg: f64,
     pub stuck_ticks: u32,
+    pub drops_taken: u32,
+    pub rear_taken: f64,
+    /// gun rounds fired, and gun rounds that hit a mech
+    pub shots: u32,
+    pub hits: u32,
 }
 impl Mech {
     pub fn size(&self) -> f64 {
@@ -244,6 +251,8 @@ pub struct Sim {
     pub death_log: Vec<(f64, usize, String)>,
     pub verbose: bool,
     /// gun shots fired / hit on mechs, by range bucket of 50 m; laser fired / hit
+    pub aim_diag: bool,
+    pub aim_acc: [[f64; 7]; 5],
     pub gun_fired: [u32; 6],
     pub gun_hit: [u32; 6],
     pub laser_fired: u32,
@@ -315,6 +324,8 @@ impl Sim {
             drop_times: cfg.get("drops").get("times").arr().iter().map(|x| x.f()).collect(),
             death_log: Vec::new(),
             verbose: false,
+            aim_diag: std::env::var("SIM_AIMDIAG").is_ok(),
+            aim_acc: [[0.0; 7]; 5],
             gun_fired: [0; 6],
             gun_hit: [0; 6],
             laser_fired: 0,
@@ -377,6 +388,10 @@ impl Sim {
                 dmg_taken: 0.0,
                 zone_dmg: 0.0,
                 stuck_ticks: 0,
+                drops_taken: 0,
+                rear_taken: 0.0,
+                shots: 0,
+                hits: 0,
             });
         }
         // crates, loot, drones
@@ -488,6 +503,12 @@ impl Sim {
         }
         let eye = m.eye();
         self.map.los_vis(eye, center) || self.map.los_vis(eye, top)
+    }
+
+    /// can mech i see mech j right now
+    pub fn sees(&self, i: usize, j: usize) -> bool {
+        let (a, b) = (&self.mechs[i], &self.mechs[j]);
+        a.alive && b.alive && self.can_see(a, b.center(), b.top())
     }
 
     pub fn obs_for(&mut self, i: usize) -> J {
@@ -681,7 +702,7 @@ impl Sim {
         }
     }
 
-    fn gain_cubes(&mut self, i: usize, n: f64) {
+    pub fn gain_cubes(&mut self, i: usize, n: f64) {
         let thr: Vec<f64> = self.hello.get("config").get("cubes").get("upgrade_thresholds").arr().iter().map(|x| x.f()).collect();
         let before = self.mechs[i].max_hp();
         self.mechs[i].cubes += n;
@@ -789,6 +810,10 @@ impl Sim {
                 let s = &mut self.mechs[b];
                 s.last_combat = t;
                 s.dmg_dealt += amount;
+                if rear {
+                    self.mechs[k].rear_taken += amount;
+                }
+                let s = &mut self.mechs[b];
                 let mut ev = vec![("type", js("hit")), ("target", num(k as f64)), ("amount", num(r2(amount))), ("weapon", js(weapon))];
                 if rear {
                     ev.push(("rear", J::Bool(true)));
@@ -1217,7 +1242,14 @@ impl Sim {
                 let energy = m.energy;
                 let wst = m.wst.clone();
                 if let Some(w) = m.w[s].as_mut() {
-                    w.cooldown = (w.cooldown - DT).max(0.0);
+                    // As the real server does (public replays: a held gun fires on ticks 1, 6, 11, 16,
+                    // 21, 25, 30, ...): the cooldown counts down every tick, the weapon fires on the tick
+                    // it runs out, and the overshoot carries into the next shot so the cadence is exact.
+                    w.cooldown -= DT;
+                    let over = w.cooldown.min(0.0).max(-DT);
+                    if w.cooldown < 0.0 {
+                        w.cooldown = 0.0;
+                    }
                     let ws = &wst[w.kind];
                     match w.kind {
                         GUN => {
@@ -1232,7 +1264,7 @@ impl Sim {
                                 snd.push(("reload", m.pos));
                             } else if fire && w.cooldown <= 0.0 && equip_ok && w.ammo > 0.0 {
                                 w.ammo -= 1.0;
-                                w.cooldown = g(ws, "cooldown");
+                                w.cooldown = g(ws, "cooldown") + over;
                                 if w.ammo <= 0.0 {
                                     w.reload = g(ws, "reload");
                                 }
@@ -1301,6 +1333,48 @@ impl Sim {
                     let w = &m.wst[GUN];
                     (m.muzzle(), m.aim, m.radius(), g(w, "speed"), g(w, "range"), g(w, "spread_deg").to_radians(), g(w, "damage") * m.dmg_mult())
                 };
+                if i == 0 && self.aim_diag {
+                    // how far off a perfect straight-line lead is the barrel right now? (lateral metres at the target)
+                    let mut best: Option<(f64, usize)> = None;
+                    for m in &self.mechs {
+                        if m.alive && m.id != i {
+                            let b = (m.pos[1] - o[1]).atan2(m.pos[0] - o[0]);
+                            let off = wrap(b - aim[0]).abs();
+                            if off < 0.12 && best.map_or(true, |x| off < x.0) {
+                                best = Some((off, m.id));
+                            }
+                        }
+                    }
+                    if let Some((_, k)) = best {
+                        let t = &self.mechs[k];
+                        let tc = [t.pos[0], t.pos[1], t.pos[2] + 4.5 * t.size()];
+                        let mut p = tc;
+                        for _ in 0..4 {
+                            let dist = ((p[0] - o[0]).powi(2) + (p[1] - o[1]).powi(2) + (p[2] - o[2]).powi(2)).sqrt();
+                            let tt = dist / speed;
+                            p = [tc[0] + t.vel[0] * tt, tc[1] + t.vel[1] * tt, tc[2]];
+                        }
+                        let dist = (p[0] - o[0]).hypot(p[1] - o[1]);
+                        let ideal = (p[1] - o[1]).atan2(p[0] - o[0]);
+                        let lat_err = wrap(aim[0] - ideal) * dist;
+                        let ideal_pitch = (p[2] - o[2]).atan2(dist);
+                        let v_err = (aim[1] - ideal_pitch) * dist;
+                        // sign convention: positive lat_err = ahead of the target's motion
+                        let los = [(tc[0] - o[0]) / dist.max(1.0), (tc[1] - o[1]) / dist.max(1.0)];
+                        let tv_lat = -t.vel[0] * los[1] + t.vel[1] * los[0];
+                        let me_v = self.mechs[i].vel;
+                        let my_lat = -me_v[0] * los[1] + me_v[1] * los[0];
+                        let b = ((dist / 50.0) as usize).min(4);
+                        let a = &mut self.aim_acc[b];
+                        a[0] += 1.0;
+                        a[1] += lat_err * lat_err;
+                        a[2] += v_err * v_err;
+                        a[3] += lat_err * tv_lat.signum();
+                        a[4] += lat_err * my_lat.signum();
+                        a[5] += tv_lat.abs();
+                        a[6] += if lat_err.abs() > 2.0 { 1.0 } else { 0.0 };
+                    }
+                }
                 let a = [aim[0] + gauss(&mut self.rng) * spread, aim[1] + gauss(&mut self.rng) * spread];
                 let d = dir3(a);
                 let off = r + 0.5;
@@ -1309,6 +1383,7 @@ impl Sim {
                 let id = self.next_id;
                 self.next_id += 1;
                 self.projs.push(Proj { id, kind: 0, owner: i, pos: start, vel: [d[0] * speed, d[1] * speed, d[2] * speed], left: range, dmg, from: o });
+                self.mechs[i].shots += 1;
                 self.sound("gun", o, Some(i));
                 let mut best = 1e9;
                 for m in &self.mechs {
@@ -1480,6 +1555,7 @@ impl Sim {
                         if let Tgt::Mech(k) = tg {
                             let dd = d2(&self.mechs[k].pos, &from);
                             self.gun_hit[((dd / 50.0) as usize).min(5)] += 1;
+                            self.mechs[owner].hits += 1;
                         }
                         self.hurt(tg, dmg, "gun", Some(owner), from)
                     }
@@ -1749,6 +1825,7 @@ impl Sim {
                 let m = &mut self.mechs[i];
                 m.hp = m.max_hp();
                 m.energy = g(&m.st, "energy");
+                m.drops_taken += 1;
                 let cubes = m.cubes;
                 m.events.push(obj(vec![("type", js("drop")), ("id", num(id as f64)), ("cubes", num(cubes))]));
             } else {
@@ -1899,6 +1976,14 @@ pub struct House {
     pub duty: f64,
     pub dodge: bool,
     pub hunt: bool,
+    /// fire only when the target has been moving steadily (0 = always fire when aligned)
+    pub gate: f64,
+    /// retreat below this HP fraction
+    pub retreat: f64,
+    tvel: [f64; 2],
+    tvel_id: i64,
+    steady_t: f64,
+    flee_until: f64,
     /// only ever target this mech id (stress test); -1 = anyone
     pub focus: i64,
     hunt_pt: (f64, f64),
@@ -1906,6 +1991,20 @@ pub struct House {
     attack_until: f64,
     rest_until: f64,
     strafe_speed: f64,
+    /// 0 = heads for the middle of the next circle when idle, 1 = roams the whole circle; values between = chance of being a roamer
+    pub roam: f64,
+    roamer: bool,
+    /// distance it tries to close to in a fight
+    pub push: f64,
+    /// 1 = full turn at the start and every 11 s when it has no target
+    pub look: f64,
+    /// squad play: only the subject is ever a target; hunters go to where the squad last saw it
+    pub sq_on: bool,
+    pub sq_hunter: bool,
+    pub sq_known: Option<([f64; 3], [f64; 3], f64)>,
+    /// seconds a non-hunter keeps fighting back after being hit
+    pub sq_grudge: f64,
+    sq_hit_t: f64,
 }
 impl House {
     pub fn new(map: Arc<Map>, seed: u64, skill: f64, aggro: f64) -> House {
@@ -1934,12 +2033,27 @@ impl House {
             duty: 0.5,
             dodge: true,
             hunt: true,
+            gate: 1.0,
+            retreat: 0.4,
+            tvel: [0.0; 2],
+            tvel_id: -1,
+            steady_t: 0.0,
+            flee_until: -1.0,
             focus: -1,
             hunt_pt: (0.0, 0.0),
             hunt_t: -100.0,
             attack_until: -1.0,
             rest_until: -1.0,
             strafe_speed: 1.0,
+            roam: 0.5,
+            roamer: (seed >> 17) & 1 == 1,
+            push: 50.0,
+            look: 0.0,
+            sq_on: false,
+            sq_hunter: false,
+            sq_known: None,
+            sq_grudge: 6.0,
+            sq_hit_t: -100.0,
         }
     }
     fn route(&mut self, from: [f64; 2], to: (f64, f64), t: f64) {
@@ -1986,6 +2100,11 @@ impl House {
     }
 }
 impl Ctl for House {
+    fn squad(&mut self, hunter: bool, known: Option<([f64; 3], [f64; 3], f64)>) {
+        self.sq_on = true;
+        self.sq_hunter = hunter;
+        self.sq_known = known;
+    }
     fn act(&mut self, o: &J) -> Action {
         let t = o.get("t").f();
         let me = o.get("self");
@@ -2009,6 +2128,7 @@ impl Ctl for House {
                     if by < 100.0 && (self.focus < 0 || by as i64 == self.focus) {
                         self.target = by as i64;
                         self.target_t = t;
+                        self.sq_hit_t = t;
                     }
                 }
             }
@@ -2049,17 +2169,21 @@ impl Ctl for House {
                     self.target_t = t;
                 }
             }
-            if vis && d <= self.aggro && nearest.map_or(true, |b| d < b.0) {
+            let may = !self.sq_on || self.sq_hunter || t - self.sq_hit_t < self.sq_grudge;
+            if may && vis && d <= self.aggro && nearest.map_or(true, |b| d < b.0) {
                 nearest = Some((d, m));
             }
         }
-        if cur.is_none() || t - self.target_t > 4.0 {
+        let sq_idle = self.sq_on && !self.sq_hunter && t - self.sq_hit_t >= self.sq_grudge;
+        if cur.is_none() || t - self.target_t > 4.0 || sq_idle {
             self.target = -1;
             cur = None;
             if let Some((_, m)) = nearest {
-                self.target = m.get("id").f() as i64;
-                self.target_t = t;
-                cur = Some(m);
+                if !sq_idle {
+                    self.target = m.get("id").f() as i64;
+                    self.target_t = t;
+                    cur = Some(m);
+                }
             }
         }
         let in_next = d2(&p2, &nc) <= nr - 5.0;
@@ -2080,14 +2204,20 @@ impl Ctl for House {
             let c = [q[0], q[1], q[2] + 4.5];
             let vis = self.map.los(muzzle, c);
             let d = d2(&q, &p);
-            // fires in spells: a couple of seconds on, then a pause while it only dodges
-            if t > self.attack_until && t > self.rest_until {
-                let on = self.rng.range(1.2, 2.8);
-                let off = on * (1.0 - self.duty) / self.duty.max(0.05) * self.rng.range(0.6, 1.4);
-                self.attack_until = t + on;
-                self.rest_until = t + on + off;
+            // shoots when it has a good solution: the target's velocity has held steady for a moment
+            let tid = m.get("id").f() as i64;
+            if tid != self.tvel_id {
+                self.tvel_id = tid;
+                self.tvel = [v[0], v[1]];
+                self.steady_t = t;
             }
-            let attacking = t <= self.attack_until;
+            if hyp(v[0] - self.tvel[0], v[1] - self.tvel[1]) > 2.5 {
+                self.steady_t = t;
+                self.tvel = [v[0], v[1]];
+            }
+            let steady = t - self.steady_t >= 0.2 * self.gate || d < 70.0 || self.gate <= 0.0;
+            let _ = (self.attack_until, self.rest_until, self.duty);
+            let attacking = steady;
             if vis {
                 // aim noise resampled a few times a second
                 if t - self.noise_t > 0.3 {
@@ -2160,7 +2290,7 @@ impl Ctl for House {
                     self.strafe_speed = self.rng.range(0.5, 1.0);
                 }
                 let b = (q[1] - p[1]).atan2(q[0] - p[0]);
-                let radial = if d > 150.0 { 0.7 } else if d < 60.0 { -0.5 } else { 0.0 };
+                let radial = if d > self.push + 25.0 { 0.9 } else if d > self.push + 8.0 { 0.45 } else if d < self.push - 20.0 { -0.5 } else { 0.0 };
                 for _ in 0..2 {
                     let sa = b + self.strafe_dir * PI / 2.0;
                     let (sx, sy) = (sa.cos() + b.cos() * radial, sa.sin() + b.sin() * radial);
@@ -2179,6 +2309,21 @@ impl Ctl for House {
                 mv = self.follow(p2);
                 boost = energy > 50.0;
                 a.aim = [(q[1] - p[1]).atan2(q[0] - p[0]), 0.0];
+            }
+            let hpf = me.get("hp").f() / me.get("max_hp").fo(1400.0).max(1.0);
+            let hit_now = o.get("events").arr().iter().any(|e| e.get("type").s() == "damaged");
+            if hpf < self.retreat && hit_now && t > self.flee_until + 6.0 {
+                self.flee_until = t + self.rng.range(3.0, 5.0);
+            }
+            if t < self.flee_until {
+                // back off out of sight for a few seconds
+                let b = (p[1] - q[1]).atan2(p[0] - q[0]) + self.strafe_dir * 0.6;
+                let ahead = (p[0] + b.cos() * 5.0, p[1] + b.sin() * 5.0);
+                if self.map.wall_dist(ahead.0, ahead.1) >= 3.2 {
+                    mv = [b.cos(), b.sin()];
+                }
+                boost = energy > 10.0;
+                a.jump = me.get("grounded").b() && self.rng.f() < 0.05;
             }
             if must_zone {
                 self.route(p2, (nc[0], nc[1]), t);
@@ -2202,6 +2347,20 @@ impl Ctl for House {
                     }
                 }
             }
+            if self.sq_on && self.sq_hunter && !must_zone {
+                // a weapon almost underfoot is still worth the detour
+                let loot_near = goal.map_or(false, |gp| d2(&p2, &[gp.0, gp.1]) < 25.0);
+                if let (Some((kp, kv, kt)), false) = (self.sq_known, loot_near) {
+                    let age = (t - kt).min(3.0);
+                    let tp = (kp[0] + kv[0] * age, kp[1] + kv[1] * age);
+                    if d2(&p2, &[tp.0, tp.1]) > 10.0 || t - kt < 1.0 {
+                        goal = Some(tp);
+                        boost = energy > 50.0;
+                    } else {
+                        goal = None;
+                    }
+                }
+            }
             if goal.is_none() && self.hunt && t - self.hunt_t < 9.0 && !must_zone && d2(&[self.hunt_pt.0, self.hunt_pt.1], &nc) <= nr + 40.0 {
                 if d2(&p2, &[self.hunt_pt.0, self.hunt_pt.1]) > 12.0 {
                     goal = Some(self.hunt_pt);
@@ -2209,6 +2368,27 @@ impl Ctl for House {
                 } else {
                     self.hunt_t = -100.0;
                 }
+            }
+            let roamer = if self.roam >= 1.0 { true } else if self.roam <= 0.0 { false } else { self.roamer };
+            if goal.is_none() && roamer && !must_zone {
+                let zc = zone.get("center").v2();
+                let zr = zone.get("radius").f().min(520.0);
+                let far = d2(&p2, &[self.wander.0, self.wander.1]);
+                if t - self.wander_t > 25.0 || far < 15.0 || d2(&[self.wander.0, self.wander.1], &nc) > nr + 30.0 {
+                    self.wander_t = t;
+                    for _ in 0..8 {
+                        let ang = self.rng.range(-PI, PI);
+                        let r = zr.min(nr + 30.0) * self.rng.f().sqrt() * 0.9;
+                        let base = if nr < zr { nc } else { zc };
+                        let cand = (base[0] + ang.cos() * r, base[1] + ang.sin() * r);
+                        if self.map.wall_dist(cand.0, cand.1) >= 3.5 {
+                            self.wander = cand;
+                            break;
+                        }
+                    }
+                }
+                goal = Some(self.wander);
+                boost = energy > 35.0;
             }
             if goal.is_none() {
                 let dc = d2(&p2, &nc);
@@ -2231,6 +2411,10 @@ impl Ctl for House {
             }
             let base = if hyp(mv[0], mv[1]) > 0.1 { mv[1].atan2(mv[0]) } else { self.last_aim[0] + 0.15 };
             a.aim = [base + 0.6 * (t * 1.7).sin(), 0.0];
+            if self.look > 0.5 && (t < 1.7 || (t % 11.0) < 1.7) {
+                // look all the way round at the start and now and then
+                a.aim = [aim_now[0] + 1.3, 0.0];
+            }
             for (i, w) in &weapons {
                 if w.get("kind").s() == "gun" && w.get("ammo").f() < 6.0 {
                     a.reload = true;
